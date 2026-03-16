@@ -1,5 +1,5 @@
 data:
-  root_dir: dataset/海域要素预测
+  root_dir: dataset/娴峰煙瑕佺礌棰勬祴
   train_years:
     - 1994
     - 1995
@@ -24,8 +24,8 @@ data:
   test_years: [2014]
   input_len: 72
   pred_len: 72
-  stride: 48
-  cache_size: 16
+  stride: 1
+  cache_size: 8
   train_start: 1994-01-01T00:00:00
   train_main_end: 2013-10-31T23:00:00
   dev_start: 2013-11-01T00:00:00
@@ -34,22 +34,26 @@ data:
   test_end: 2014-12-31T23:00:00
 
 model:
-  name: convlstm
-  hidden_dims: [32, 32]
-  kernel_size: 3
+  name: cnn_transformer
+  hidden_dim: 64
+  num_heads: 4
+  num_layers: 2
+  ff_dim: 256
   dropout: 0.1
+  max_input_len: 128
+  max_pred_len: 128
 
 train:
   batch_size: 2
   lr: 0.001
   weight_decay: 0.0001
-  epochs: 3
-  patience: 2
+  epochs: 20
+  patience: 5
   num_workers: 2
   device: cuda
   amp: true
   seed: 42
   shuffle_train: false
-  output_dir: outputs/train_mid_8gb_full
+  output_dir: outputs/cnn_transformer_baseline
   max_train_batches:
   max_eval_batches:

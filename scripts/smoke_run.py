@@ -45,10 +45,8 @@ def main() -> None:
         str(output_dir / "best.ckpt"),
         "--start_time",
         args.start_time,
-        "--output",
-        str(output_dir / "pred.npz"),
-        "--stats_csv",
-        str(output_dir / "pred_stats.csv"),
+        "--viz_dir",
+        str(output_dir / "viz"),
         "--auto_shift_start",
     ]
     subprocess.run(infer_cmd, check=True)

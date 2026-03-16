@@ -43,6 +43,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "output_dir": "outputs/convlstm_baseline",
         "max_train_batches": None,
         "max_eval_batches": None,
+        "physics_loss": {
+            "enabled": False,
+            "weight": 0.0,
+            "spatial_weight": 1.0,
+            "temporal_weight": 1.0,
+        },
     },
 }
 
@@ -69,4 +75,3 @@ def save_config(config: Dict[str, Any], path: str | Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     with dst.open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
-

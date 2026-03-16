@@ -19,7 +19,7 @@ from .data.dataset import (
     split_refs,
 )
 from .data.zip_reader import parse_datetime64, ZipNetCDFReader
-from .losses import masked_mse_loss
+from .losses import masked_mse_loss, masked_physics_loss
 from .metrics import MaskedChannelRMSE, rmse_to_nrmse, summarize_channel_metrics
 from .models.registry import build_model
 from .utils import resolve_device, set_seed
@@ -76,6 +76,14 @@ def evaluate(
     metrics = summarize_channel_metrics(rmse, nrmse)
     metrics["loss"] = total_loss / max(n_batches, 1)
     return metrics
+
+
+def _build_model_kwargs(model_cfg: Dict, pred_len: int) -> Dict:
+    kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
+    kwargs["input_channels"] = 4
+    kwargs["output_channels"] = 3
+    kwargs["default_pred_len"] = int(pred_len)
+    return kwargs
 
 
 def main() -> None:
@@ -160,15 +168,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = build_model(
-        model_name=model_cfg["name"],
-        input_channels=4,
-        output_channels=3,
-        hidden_dims=model_cfg["hidden_dims"],
-        kernel_size=model_cfg["kernel_size"],
-        dropout=model_cfg.get("dropout", 0.0),
-        default_pred_len=pred_len,
-    ).to(device)
+    model = build_model(model_name=model_cfg["name"], **_build_model_kwargs(model_cfg, pred_len)).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg["lr"]),
@@ -192,10 +192,17 @@ def main() -> None:
     max_train_batches = train_cfg.get("max_train_batches", None)
     max_eval_batches = train_cfg.get("max_eval_batches", None)
     patience = int(train_cfg["patience"])
+    physics_cfg = train_cfg.get("physics_loss", {}) or {}
+    physics_enabled = bool(physics_cfg.get("enabled", False))
+    physics_weight = float(physics_cfg.get("weight", 0.0))
+    physics_spatial_weight = float(physics_cfg.get("spatial_weight", 1.0))
+    physics_temporal_weight = float(physics_cfg.get("temporal_weight", 1.0))
 
     for epoch in range(1, epochs + 1):
         model.train()
         total_train_loss = 0.0
+        total_train_data_loss = 0.0
+        total_train_physics_loss = 0.0
         n_train_batches = 0
 
         for b_idx, batch in enumerate(train_loader):
@@ -213,16 +220,31 @@ def main() -> None:
 
             with autocast_ctx:
                 pred = model(batch["x"])
-                loss = masked_mse_loss(pred, batch["y"], batch["mask"])
+                data_loss = masked_mse_loss(pred, batch["y"], batch["mask"])
+                if physics_enabled and physics_weight > 0:
+                    physics_loss = masked_physics_loss(
+                        pred,
+                        batch["mask"],
+                        spatial_weight=physics_spatial_weight,
+                        temporal_weight=physics_temporal_weight,
+                    )
+                    loss = data_loss + physics_weight * physics_loss
+                else:
+                    physics_loss = pred.new_zeros(())
+                    loss = data_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             total_train_loss += float(loss.item())
+            total_train_data_loss += float(data_loss.item())
+            total_train_physics_loss += float(physics_loss.item())
             n_train_batches += 1
 
         train_loss = total_train_loss / max(n_train_batches, 1)
+        train_data_loss = total_train_data_loss / max(n_train_batches, 1)
+        train_physics_loss = total_train_physics_loss / max(n_train_batches, 1)
         dev_metrics = evaluate(
             model,
             dev_loader,
@@ -236,6 +258,9 @@ def main() -> None:
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_data_loss": train_data_loss,
+            "train_physics_loss": train_physics_loss,
+            "physics_weight": physics_weight,
             "dev_loss": dev_metrics["loss"],
             "dev_nrmse_mean": dev_metrics["nrmse_mean"],
             "dev_nrmse_sst": dev_metrics["nrmse_sst"],

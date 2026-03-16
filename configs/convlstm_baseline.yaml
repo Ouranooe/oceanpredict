@@ -40,17 +40,16 @@ model:
   dropout: 0.1
 
 train:
-  batch_size: 2
+  batch_size: 4
   lr: 0.001
   weight_decay: 0.0001
   epochs: 20
   patience: 5
-  num_workers: 0
-  device: auto
+  num_workers: 2
+  device: cuda
   amp: true
   seed: 42
   shuffle_train: false
   output_dir: outputs/convlstm_baseline
   max_train_batches:
   max_eval_batches:
-

@@ -1,25 +1,7 @@
 ﻿data:
   base_root: dataset_base/sea_v1
-  format: npy_yearly
-  root_dir: dataset_std/sea_yearly
+  root_dir: dataset/娴峰煙瑕佺礌棰勬祴
   train_years:
-    # - 1994
-    # - 1995
-    # - 1996
-    # - 1997
-    # - 1998
-    # - 1999
-    # - 2000
-    # - 2001
-    # - 2002
-    # - 2003
-    # - 2004
-    # - 2005
-    # - 2006
-    # - 2007
-    # - 2008
-    # - 2009
-    # - 2010
     - 2011
     - 2012
     - 2013
@@ -27,7 +9,7 @@
   input_len: 96
   pred_len: 72
   stride: 6
-  cache_size: 16
+  cache_size: 64
   train_start: 2011-01-01T00:00:00
   train_main_end: 2013-10-31T23:00:00
   dev_start: 2013-11-01T00:00:00
@@ -42,18 +24,17 @@ model:
   dropout: 0.1
 
 train:
-  batch_size: 1
+  batch_size: 2 
   lr: 0.001
   weight_decay: 0.0001
   epochs: 60
-  patience: 5
+  patience: 4
   num_workers: 0
   device: cuda
   amp: true
   seed: 42
   shuffle_train: false
-  output_dir: outputs/train_mid_8gb_full
+  output_dir: outputs/train_mid_8gb_pred96_stable
   max_train_batches:
   max_eval_batches:
-
 

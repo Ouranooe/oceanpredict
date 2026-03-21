@@ -11,7 +11,14 @@ import torch
 
 from .config import load_config
 from .data.dataset import load_stats
-from .data.zip_reader import datetime_to_hour_index, hour_index_to_datetime, parse_datetime64, ZipNetCDFReader
+from .data.reader_factory import build_reader
+from .data.zip_reader import datetime_to_hour_index, hour_index_to_datetime, parse_datetime64
+from .input_features import (
+    BASE_INPUT_CHANNELS,
+    augment_input_array,
+    compute_model_input_channels,
+    parse_input_feature_config,
+)
 from .metrics import MaskedChannelRMSE, rmse_to_nrmse, summarize_channel_metrics
 from .models.registry import build_model
 from .utils import resolve_device
@@ -19,9 +26,9 @@ from .utils import resolve_device
 CHANNEL_NAMES = ("sst", "sss", "speed")
 
 
-def _build_model_kwargs(model_cfg: Dict, pred_len: int) -> Dict:
+def _build_model_kwargs(model_cfg: Dict, pred_len: int, input_channels: int) -> Dict:
     kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
-    kwargs["input_channels"] = 4
+    kwargs["input_channels"] = int(input_channels)
     kwargs["output_channels"] = 3
     kwargs["default_pred_len"] = int(pred_len)
     return kwargs
@@ -49,7 +56,7 @@ def _sample_frame_indices(total_steps: int, every_hours: int) -> List[int]:
 
 
 def _try_collect_ground_truth(
-    reader: ZipNetCDFReader,
+    reader: object,
     ref_map: Dict[int, object],
     forecast_hours: np.ndarray,
     ocean_mask: np.ndarray,
@@ -60,7 +67,7 @@ def _try_collect_ground_truth(
 
     gt_frames = []
     for hour in forecast_hours:
-        frame, _ = reader.read_frame(ref_map[int(hour)])
+        frame, _ = reader.read_frame(ref_map[int(hour)])  # type: ignore[attr-defined]
         speed = np.sqrt(np.square(frame[2]) + np.square(frame[3]))
         target = np.stack([frame[0], frame[1], speed], axis=0).astype(np.float32)
         gt_frames.append(target)
@@ -125,7 +132,7 @@ def _save_visualizations(
     import matplotlib.pyplot as plt
 
     viz_dir.mkdir(parents=True, exist_ok=True)
-    lon2d, lat2d = np.meshgrid(lon, lat)
+    extent = (float(np.min(lon)), float(np.max(lon)), float(np.min(lat)), float(np.max(lat)))
     frame_indices = _sample_frame_indices(pred_raw.shape[0], sample_every_hours)
     start_tag = _sanitize_time_for_filename(str(start_time))
     image_paths: List[str] = []
@@ -137,7 +144,7 @@ def _save_visualizations(
         offset_hour = int(f_hour - start_hour)
 
         if has_gt:
-            fig, axes = plt.subplots(3, 3, figsize=(14, 11), constrained_layout=True)
+            fig, axes = plt.subplots(3, 3, figsize=(14, 11))
             col_titles = ("Pred", "GT", "Error")
             for c, cname in enumerate(CHANNEL_NAMES):
                 pred_map = pred_raw[t_idx, c]
@@ -156,20 +163,36 @@ def _save_visualizations(
                 )
                 for col, (panel_data, title, cmap, pmin, pmax) in enumerate(panels):
                     ax = axes[c, col]
-                    mesh = ax.pcolormesh(lon2d, lat2d, panel_data, shading="auto", cmap=cmap, vmin=pmin, vmax=pmax)
+                    mesh = ax.imshow(
+                        panel_data,
+                        origin="lower",
+                        extent=extent,
+                        cmap=cmap,
+                        vmin=pmin,
+                        vmax=pmax,
+                        aspect="auto",
+                    )
                     ax.set_title(f"{cname.upper()} {title}", fontsize=10)
                     ax.set_xlabel("Lon")
                     ax.set_ylabel("Lat")
                     fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
         else:
-            fig, axes = plt.subplots(3, 1, figsize=(6, 11), constrained_layout=True)
+            fig, axes = plt.subplots(3, 1, figsize=(6, 11))
             if not isinstance(axes, np.ndarray):
                 axes = np.array([axes])
             for c, cname in enumerate(CHANNEL_NAMES):
                 panel_data = pred_raw[t_idx, c]
                 vmin, vmax = _safe_min_max(panel_data)
                 ax = axes[c]
-                mesh = ax.pcolormesh(lon2d, lat2d, panel_data, shading="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+                mesh = ax.imshow(
+                    panel_data,
+                    origin="lower",
+                    extent=extent,
+                    cmap="viridis",
+                    vmin=vmin,
+                    vmax=vmax,
+                    aspect="auto",
+                )
                 ax.set_title(f"{cname.upper()} Pred", fontsize=10)
                 ax.set_xlabel("Lon")
                 ax.set_ylabel("Lat")
@@ -238,6 +261,8 @@ def main() -> None:
     cfg = load_config(args.config)
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
+    input_feature_cfg = parse_input_feature_config(data_cfg)
+    model_input_channels = compute_model_input_channels(BASE_INPUT_CHANNELS, input_feature_cfg)
     device_cfg = args.device if args.device is not None else cfg["train"]["device"]
     device = resolve_device(device_cfg)
 
@@ -245,11 +270,7 @@ def main() -> None:
     stats = load_stats(args.stats_path) if args.stats_path else _stats_from_checkpoint(ckpt)
 
     years = sorted(set(data_cfg["train_years"] + data_cfg["test_years"]))
-    reader = ZipNetCDFReader(
-        root_dir=data_cfg["root_dir"],
-        years=years,
-        cache_size=data_cfg.get("cache_size", 8),
-    )
+    reader = build_reader(data_cfg=data_cfg, years=years)
 
     input_len = int(data_cfg["input_len"])
     pred_len = int(data_cfg["pred_len"])
@@ -317,9 +338,18 @@ def main() -> None:
 
     x = (x_raw - input_mean[None, :, None, None]) / input_std[None, :, None, None]
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = augment_input_array(
+        x=x,
+        t_in=input_hours,
+        mask=ocean_mask.astype(np.float32),
+        feature_cfg=input_feature_cfg,
+    )
     x_tensor = torch.from_numpy(x).unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    model = build_model(model_name=model_cfg["name"], **_build_model_kwargs(model_cfg, pred_len))
+    model = build_model(
+        model_name=model_cfg["name"],
+        **_build_model_kwargs(model_cfg, pred_len, model_input_channels),
+    )
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
     model.eval()

@@ -1,4 +1,5 @@
 data:
+  base_root: dataset_base/sea_v1
   root_dir: dataset/海域要素预测
   train_years:
     - 1994

@@ -1,0 +1,16 @@
+name: ocean4090d
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.5.*
+  - pytorch-cuda=12.1
+  - numpy
+  - pyyaml
+  - h5py
+  - matplotlib
+  - pip
+  - pip:
+      - pytest

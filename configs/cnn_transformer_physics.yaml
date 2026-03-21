@@ -1,5 +1,6 @@
-data:
-  root_dir: dataset/娴峰煙瑕佺礌棰勬祴
+﻿data:
+  base_root: dataset_base/sea_v1
+  root_dir: dataset/海域要素预测
   train_years:
     - 1994
     - 1995
@@ -32,6 +33,10 @@ data:
   dev_end: 2013-12-31T23:00:00
   test_start: 2014-01-01T00:00:00
   test_end: 2014-12-31T23:00:00
+  input_features:
+    add_mask: true
+    add_time_hour: true
+    add_time_year: true
 
 model:
   name: cnn_transformer_phys

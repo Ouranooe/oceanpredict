@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .zip_reader import FrameRef, ZipNetCDFReader, parse_datetime64
+from .zip_reader import FrameRef, parse_datetime64
 
 
 TARGET_VARIABLES = ("sst", "sss", "speed")
@@ -82,7 +82,7 @@ def _update_channel_stats(
 
 
 def compute_normalization_stats(
-    reader: ZipNetCDFReader,
+    reader: Any,
     refs: Sequence[FrameRef],
 ) -> Dict[str, np.ndarray]:
     in_sum = np.zeros(4, dtype=np.float64)
@@ -144,7 +144,7 @@ def load_stats(path: str | Path) -> Dict[str, np.ndarray]:
 class OceanSeqDataset(Dataset):
     def __init__(
         self,
-        reader: ZipNetCDFReader,
+        reader: Any,
         refs: Sequence[FrameRef],
         window_starts: Sequence[int],
         input_len: int,
@@ -200,3 +200,6 @@ class OceanSeqDataset(Dataset):
             "t_out": torch.from_numpy(t_out),
         }
 
+
+class PreparedSeqDataset(OceanSeqDataset):
+    """Alias dataset used by prepared-artifact training pipeline."""

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 
@@ -9,7 +7,7 @@ from .base import BaseForecaster
 
 
 class CNNTransformerForecaster(BaseForecaster):
-    """CNN encoder + transformer backbone + CNN decoder."""
+    """CNN encoder + transformer backbone + light cross-attn conditioned decoder."""
 
     def __init__(
         self,
@@ -55,7 +53,17 @@ class CNNTransformerForecaster(BaseForecaster):
 
         self.input_pos = nn.Parameter(torch.randn(self.max_input_len, self.hidden_dim) * 0.02)
         self.future_queries = nn.Parameter(torch.randn(self.max_pred_len, self.hidden_dim) * 0.02)
-        self.key_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.future_norm = nn.LayerNorm(self.hidden_dim)
+        self.future_to_film = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim * 2),
+        )
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         self.decoder = nn.Sequential(
@@ -78,15 +86,23 @@ class CNNTransformerForecaster(BaseForecaster):
         enc = self.encoder(x.reshape(b * t_in, c_in, h, w))
         feats = enc.reshape(b, t_in, self.hidden_dim, h, w)
 
-        tokens = feats.mean(dim=(-1, -2))
-        tokens = tokens + self.input_pos[:t_in].unsqueeze(0)
-        backbone_tokens = self.backbone_norm(self.backbone(tokens))
+        history_tokens = feats.mean(dim=(-1, -2))
+        history_tokens = history_tokens + self.input_pos[:t_in].unsqueeze(0)
+        history_tokens = self.backbone_norm(self.backbone(history_tokens))
 
-        keys = self.key_proj(backbone_tokens)
-        queries = self.future_queries[:t_out].unsqueeze(0).expand(b, -1, -1)
-        attn_scores = torch.einsum("bsd,btd->bst", queries, keys) / math.sqrt(float(self.hidden_dim))
-        attn_weights = torch.softmax(attn_scores, dim=-1)
+        query_tokens = self.future_queries[:t_out].unsqueeze(0).expand(b, -1, -1)
+        cross_tokens, attn_weights = self.cross_attn(
+            query=query_tokens,
+            key=history_tokens,
+            value=history_tokens,
+            need_weights=True,
+        )
+        future_tokens = self.future_norm(query_tokens + cross_tokens)
 
         context = torch.einsum("bst,btdhw->bsdhw", attn_weights, feats)
+        film = self.future_to_film(self.dropout(future_tokens))
+        scale, bias = torch.chunk(film, chunks=2, dim=-1)
+        context = context * (1.0 + scale.unsqueeze(-1).unsqueeze(-1)) + bias.unsqueeze(-1).unsqueeze(-1)
+
         decoded = self.decoder(self.dropout(context.reshape(b * t_out, self.hidden_dim, h, w)))
         return decoded.reshape(b, t_out, -1, h, w)

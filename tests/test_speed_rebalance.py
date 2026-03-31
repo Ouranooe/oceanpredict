@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 from torch.utils.data import WeightedRandomSampler
 
 from ocean_forecast.train import (
     _assign_speed_bins,
     _build_train_speed_rebalance_sampler,
+    _compute_batch_speed_gt_means,
     _compute_future_window_mean_speed,
+    _masked_speed_aux_loss,
 )
 from ocean_forecast.data.zip_reader import FrameRef
 
@@ -113,3 +116,46 @@ def test_build_train_speed_rebalance_sampler_invalid_bin_weights_raises() -> Non
                 "stat": "future_ocean_mean",
             },
         )
+
+
+def test_masked_speed_aux_loss_uv_huber_and_mse() -> None:
+    pred = torch.zeros(1, 2, 4, 2, 2, dtype=torch.float32)
+    target = torch.zeros(1, 2, 4, 2, 2, dtype=torch.float32)
+    mask = torch.ones(1, 2, 2, dtype=torch.float32)
+    target_mean = np.zeros(4, dtype=np.float32)
+    target_std = np.ones(4, dtype=np.float32)
+
+    # Introduce speed error through u-channel at t=1.
+    pred[:, 1, 2, :, :] = 1.0
+
+    loss_huber = _masked_speed_aux_loss(
+        pred_norm=pred,
+        target_norm=target,
+        mask=mask,
+        target_mean=target_mean,
+        target_std=target_std,
+        loss_type="huber",
+        huber_delta=0.1,
+    )
+    loss_mse = _masked_speed_aux_loss(
+        pred_norm=pred,
+        target_norm=target,
+        mask=mask,
+        target_mean=target_mean,
+        target_std=target_std,
+        loss_type="mse",
+        huber_delta=0.1,
+    )
+    assert torch.isfinite(loss_huber)
+    assert torch.isfinite(loss_mse)
+    assert float(loss_huber.item()) > 0.0
+    assert float(loss_mse.item()) > float(loss_huber.item())
+
+
+def test_compute_batch_speed_gt_means_matches_masked_average() -> None:
+    y_eval = torch.zeros(2, 2, 3, 2, 2, dtype=torch.float32)
+    y_eval[0, :, 2, :, :] = 0.2
+    y_eval[1, :, 2, :, :] = 0.5
+    mask = torch.tensor([[[1.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [1.0, 0.0]]], dtype=torch.float32)
+    means = _compute_batch_speed_gt_means(y_eval=y_eval, mask=mask)
+    assert np.allclose(means, np.array([0.2, 0.5], dtype=np.float64), atol=1e-6)

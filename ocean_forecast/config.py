@@ -76,6 +76,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "weight": 0.0,
             "channels": ["sst", "sss", "speed"],
         },
+        "speed_aux_loss": {
+            "enabled": True,
+            "weight": 0.1,
+            "type": "huber",
+            "huber_delta": 0.05,
+        },
         "speed_rebalance": {
             "enabled": True,
             "bin_edges": [0.1, 0.2, 0.4],

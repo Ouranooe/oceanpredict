@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .config import load_config, save_config
@@ -72,6 +73,7 @@ def evaluate(
     target_std: np.ndarray,
     nrmse_denom: np.ndarray,
     input_feature_cfg: Dict[str, bool],
+    speed_bucket_edges: np.ndarray | None = None,
     max_batches: int | None = None,
 ) -> Dict[str, float]:
     metrics, _ = evaluate_with_profile(
@@ -82,6 +84,7 @@ def evaluate(
         target_std=target_std,
         nrmse_denom=nrmse_denom,
         input_feature_cfg=input_feature_cfg,
+        speed_bucket_edges=speed_bucket_edges,
         max_batches=max_batches,
     )
     return metrics
@@ -95,6 +98,7 @@ def evaluate_with_profile(
     target_std: np.ndarray,
     nrmse_denom: np.ndarray,
     input_feature_cfg: Dict[str, bool],
+    speed_bucket_edges: np.ndarray | None = None,
     max_batches: int | None = None,
 ) -> tuple[Dict[str, float], Dict[str, float]]:
     model.eval()
@@ -105,6 +109,19 @@ def evaluate_with_profile(
 
     mean_t = torch.tensor(target_mean, dtype=torch.float32, device=device).view(1, 1, -1, 1, 1)
     std_t = torch.tensor(target_std, dtype=torch.float32, device=device).view(1, 1, -1, 1, 1)
+    bucket_edges = None
+    bucket_sum_sq = None
+    bucket_count = None
+    bucket_samples = None
+    if speed_bucket_edges is not None:
+        bucket_edges = _validate_speed_bucket_edges(
+            speed_bucket_edges,
+            cfg_key="evaluate.speed_bucket_edges",
+        ).astype(np.float64)
+        n_bucket = int(bucket_edges.size) + 1
+        bucket_sum_sq = np.zeros((n_bucket,), dtype=np.float64)
+        bucket_count = np.zeros((n_bucket,), dtype=np.float64)
+        bucket_samples = np.zeros((n_bucket,), dtype=np.float64)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device=device)
@@ -131,6 +148,26 @@ def evaluate_with_profile(
             pred_eval = to_eval_channels_torch(pred_raw)
             y_eval = to_eval_channels_torch(y_raw)
             meter.update(pred_eval, y_eval, batch["mask"])
+            if bucket_edges is not None and bucket_sum_sq is not None and bucket_count is not None and bucket_samples is not None:
+                speed_gt_means = _compute_batch_speed_gt_means(y_eval=y_eval, mask=batch["mask"])
+                speed_bucket_idx = _assign_speed_bins(speed_gt=speed_gt_means, bin_edges=bucket_edges)
+                batch_bucket_counts = np.bincount(speed_bucket_idx, minlength=bucket_sum_sq.size)
+                bucket_samples += batch_bucket_counts.astype(np.float64, copy=False)
+
+                mask = batch["mask"]
+                if mask.dim() == 2:
+                    mask = mask.unsqueeze(0)
+                speed_err2 = torch.square(pred_eval[:, :, 2, :, :] - y_eval[:, :, 2, :, :])
+                valid = mask.to(dtype=speed_err2.dtype, device=speed_err2.device).unsqueeze(1).expand_as(speed_err2)
+                for bucket_i in range(bucket_sum_sq.size):
+                    sample_sel_np = speed_bucket_idx == bucket_i
+                    if not np.any(sample_sel_np):
+                        continue
+                    sample_sel = torch.as_tensor(sample_sel_np, device=speed_err2.device, dtype=speed_err2.dtype)
+                    sample_sel = sample_sel.view(-1, 1, 1, 1)
+                    valid_bucket = valid * sample_sel
+                    bucket_sum_sq[bucket_i] += float((speed_err2 * valid_bucket).sum().item())
+                    bucket_count[bucket_i] += float(valid_bucket.sum().item())
     if device.type == "cuda":
         torch.cuda.synchronize(device=device)
     total_eval_seconds = time.perf_counter() - eval_start
@@ -139,6 +176,14 @@ def evaluate_with_profile(
     nrmse = rmse_to_nrmse(rmse, nrmse_denom)
     metrics = summarize_channel_metrics(rmse, nrmse)
     metrics["loss"] = total_loss / max(n_batches, 1)
+    if bucket_edges is not None and bucket_sum_sq is not None and bucket_count is not None and bucket_samples is not None:
+        _append_speed_bucket_metrics(
+            metrics=metrics,
+            bucket_sum_sq=bucket_sum_sq,
+            bucket_count=bucket_count,
+            bucket_samples=bucket_samples,
+            nrmse_denom=nrmse_denom,
+        )
     avg_batch_seconds = total_eval_seconds / n_batches if n_batches > 0 else 0.0
     avg_sample_seconds = total_eval_seconds / n_samples if n_samples > 0 else 0.0
     samples_per_second = n_samples / total_eval_seconds if total_eval_seconds > 0 and n_samples > 0 else 0.0
@@ -324,6 +369,20 @@ def _refs_to_indices(refs: List[FrameRef], ref_map: Dict[int, int]) -> np.ndarra
     return np.asarray([ref_map[int(r.hour_index)] for r in refs], dtype=np.int64)
 
 
+def _validate_speed_bucket_edges(
+    bin_edges_raw: Any,
+    cfg_key: str = "train.speed_rebalance.bin_edges",
+) -> np.ndarray:
+    bin_edges = np.asarray(bin_edges_raw, dtype=np.float64)
+    if bin_edges.ndim != 1 or bin_edges.size == 0:
+        raise ValueError(f"{cfg_key} must be a non-empty 1D array.")
+    if not np.isfinite(bin_edges).all():
+        raise ValueError(f"{cfg_key} must contain finite values.")
+    if not np.all(np.diff(bin_edges) > 0):
+        raise ValueError(f"{cfg_key} must be strictly increasing.")
+    return bin_edges.astype(np.float32)
+
+
 def _validate_speed_rebalance_config(speed_rebalance_cfg: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, str]:
     stat = str(speed_rebalance_cfg.get("stat", "future_ocean_mean"))
     if stat != "future_ocean_mean":
@@ -332,16 +391,10 @@ def _validate_speed_rebalance_config(speed_rebalance_cfg: Dict[str, Any]) -> Tup
             "Only 'future_ocean_mean' is supported."
         )
 
-    bin_edges = np.asarray(
+    bin_edges = _validate_speed_bucket_edges(
         speed_rebalance_cfg.get("bin_edges", [0.1, 0.2, 0.4]),
-        dtype=np.float64,
+        cfg_key="train.speed_rebalance.bin_edges",
     )
-    if bin_edges.ndim != 1 or bin_edges.size == 0:
-        raise ValueError("train.speed_rebalance.bin_edges must be a non-empty 1D array.")
-    if not np.isfinite(bin_edges).all():
-        raise ValueError("train.speed_rebalance.bin_edges must contain finite values.")
-    if not np.all(np.diff(bin_edges) > 0):
-        raise ValueError("train.speed_rebalance.bin_edges must be strictly increasing.")
 
     bin_weights = np.asarray(
         speed_rebalance_cfg.get("bin_weights", [1.0, 1.5, 2.5, 4.0]),
@@ -358,7 +411,7 @@ def _validate_speed_rebalance_config(speed_rebalance_cfg: Dict[str, Any]) -> Tup
     if np.any(bin_weights <= 0):
         raise ValueError("train.speed_rebalance.bin_weights must be > 0.")
 
-    return bin_edges.astype(np.float32), bin_weights.astype(np.float32), stat
+    return bin_edges, bin_weights.astype(np.float32), stat
 
 
 def _assign_speed_bins(speed_gt: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
@@ -414,6 +467,119 @@ def _speed_bucket_labels(bin_edges: np.ndarray) -> List[str]:
     labels.extend(f"{edges[i]:g}-{edges[i + 1]:g}" for i in range(int(edges.size) - 1))
     labels.append(f">={edges[-1]:g}")
     return labels
+
+
+def _compute_batch_speed_gt_means(
+    y_eval: torch.Tensor,
+    mask: torch.Tensor,
+) -> np.ndarray:
+    if y_eval.dim() != 5:
+        raise ValueError(f"y_eval must be [B,T,C,H,W], got {tuple(y_eval.shape)}")
+    if y_eval.size(2) < 3:
+        raise ValueError(f"y_eval must include speed channel at C=2, got C={int(y_eval.size(2))}.")
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    if mask.dim() != 3:
+        raise ValueError(f"mask must be [H,W] or [B,H,W], got {tuple(mask.shape)}")
+
+    speed = y_eval[:, :, 2, :, :]
+    valid = mask.to(dtype=speed.dtype, device=speed.device).unsqueeze(1).expand_as(speed)
+    sum_speed = (speed * valid).sum(dim=(1, 2, 3))
+    valid_count = torch.clamp(valid.sum(dim=(1, 2, 3)), min=1.0)
+    mean_speed = sum_speed / valid_count
+    return mean_speed.detach().cpu().numpy().astype(np.float64)
+
+
+def _masked_speed_aux_loss(
+    pred_norm: torch.Tensor,
+    target_norm: torch.Tensor,
+    mask: torch.Tensor,
+    target_mean: torch.Tensor | np.ndarray,
+    target_std: torch.Tensor | np.ndarray,
+    loss_type: str = "huber",
+    huber_delta: float = 0.05,
+) -> torch.Tensor:
+    if pred_norm.dim() != 5 or target_norm.dim() != 5:
+        raise ValueError(
+            f"pred_norm/target_norm must be [B,T,C,H,W], got {tuple(pred_norm.shape)} and {tuple(target_norm.shape)}"
+        )
+    if pred_norm.shape != target_norm.shape:
+        raise ValueError(f"pred_norm and target_norm shape mismatch: {pred_norm.shape} vs {target_norm.shape}")
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    if mask.dim() != 3:
+        raise ValueError(f"mask must be [H,W] or [B,H,W], got {tuple(mask.shape)}")
+
+    mean_t = torch.as_tensor(target_mean, dtype=pred_norm.dtype, device=pred_norm.device).view(1, 1, -1, 1, 1)
+    std_t = torch.as_tensor(target_std, dtype=pred_norm.dtype, device=pred_norm.device).view(1, 1, -1, 1, 1)
+    pred_raw = pred_norm * std_t + mean_t
+    target_raw = target_norm * std_t + mean_t
+    channels = int(pred_raw.size(2))
+    if channels == 3:
+        pred_speed = pred_raw[:, :, 2, :, :]
+        target_speed = target_raw[:, :, 2, :, :]
+    elif channels >= 4:
+        pred_speed = torch.sqrt(torch.square(pred_raw[:, :, 2, :, :]) + torch.square(pred_raw[:, :, 3, :, :]))
+        target_speed = torch.sqrt(torch.square(target_raw[:, :, 2, :, :]) + torch.square(target_raw[:, :, 3, :, :]))
+    else:
+        raise ValueError(f"Unsupported channel count for speed aux loss: C={channels}. Expected 3 or 4+.")
+
+    diff = pred_speed - target_speed
+    loss_type_norm = str(loss_type).lower()
+    if loss_type_norm == "mse":
+        loss_map = torch.square(diff)
+    elif loss_type_norm == "huber":
+        beta = float(huber_delta)
+        if beta <= 0:
+            raise ValueError(f"speed_aux_loss.huber_delta must be > 0 for huber loss, got {huber_delta}.")
+        loss_map = F.smooth_l1_loss(pred_speed, target_speed, reduction="none", beta=beta)
+    else:
+        raise ValueError(f"Unsupported speed_aux_loss.type='{loss_type}'. Expected 'huber' or 'mse'.")
+
+    valid = mask.to(dtype=loss_map.dtype, device=loss_map.device).unsqueeze(1).expand_as(loss_map)
+    denom = torch.clamp(valid.sum(), min=1.0)
+    return (loss_map * valid).sum() / denom
+
+
+def _append_speed_bucket_metrics(
+    metrics: Dict[str, float],
+    bucket_sum_sq: np.ndarray,
+    bucket_count: np.ndarray,
+    bucket_samples: np.ndarray,
+    nrmse_denom: np.ndarray,
+) -> None:
+    speed_denom = float(np.maximum(np.asarray(nrmse_denom, dtype=np.float64)[2], 1e-12))
+    for idx in range(int(bucket_sum_sq.size)):
+        sum_sq = float(bucket_sum_sq[idx])
+        cnt = float(bucket_count[idx])
+        samples = float(bucket_samples[idx])
+        if cnt > 0.0:
+            rmse = float(np.sqrt(sum_sq / cnt))
+            nrmse = float(rmse / speed_denom)
+        else:
+            rmse = float("nan")
+            nrmse = float("nan")
+        metrics[f"speed_bucket_{idx}_samples"] = samples
+        metrics[f"speed_bucket_{idx}_rmse"] = rmse
+        metrics[f"speed_bucket_{idx}_nrmse"] = nrmse
+
+
+def _log_bucket_eval_metrics(metrics: Dict[str, float], bucket_edges: np.ndarray, prefix: str) -> None:
+    labels = _speed_bucket_labels(bucket_edges)
+    for idx, label in enumerate(labels):
+        samples = int(round(float(metrics.get(f"speed_bucket_{idx}_samples", 0.0))))
+        rmse = float(metrics.get(f"speed_bucket_{idx}_rmse", float("nan")))
+        nrmse = float(metrics.get(f"speed_bucket_{idx}_nrmse", float("nan")))
+        if np.isfinite(rmse) and np.isfinite(nrmse):
+            _log(
+                f"{prefix} speed bucket {label}: samples={samples}, "
+                f"rmse_speed={rmse:.6f}, nrmse_speed={nrmse:.6f}"
+            )
+        else:
+            _log(
+                f"{prefix} speed bucket {label}: samples={samples}, "
+                "rmse_speed=nan, nrmse_speed=nan"
+            )
 
 
 def _build_train_speed_rebalance_sampler(
@@ -647,6 +813,10 @@ def main() -> None:
     )
 
     speed_rebalance_cfg = train_cfg.get("speed_rebalance", {}) or {}
+    speed_bucket_edges = _validate_speed_bucket_edges(
+        speed_rebalance_cfg.get("bin_edges", [0.1, 0.2, 0.4]),
+        cfg_key="train.speed_rebalance.bin_edges",
+    )
     train_sampler, speed_rebalance_meta = _build_train_speed_rebalance_sampler(
         reader=reader,
         train_refs=split.train_main,
@@ -834,12 +1004,26 @@ def main() -> None:
     smoothness_weight = float(smoothness_cfg.get("weight", 0.0))
     smoothness_spatial_weight = float(smoothness_cfg.get("spatial_weight", 1.0))
     smoothness_temporal_weight = float(smoothness_cfg.get("temporal_weight", 1.0))
+    speed_aux_cfg = train_cfg.get("speed_aux_loss", {}) or {}
+    speed_aux_enabled = bool(speed_aux_cfg.get("enabled", True))
+    speed_aux_weight = float(speed_aux_cfg.get("weight", 0.1))
+    speed_aux_type = str(speed_aux_cfg.get("type", "huber")).lower()
+    speed_aux_huber_delta = float(speed_aux_cfg.get("huber_delta", 0.05))
+    if speed_aux_type not in ("huber", "mse"):
+        raise ValueError(
+            f"Unsupported train.speed_aux_loss.type='{speed_aux_type}'. Expected 'huber' or 'mse'."
+        )
+    if speed_aux_type == "huber" and speed_aux_huber_delta <= 0:
+        raise ValueError(
+            "train.speed_aux_loss.huber_delta must be > 0 when type='huber'."
+        )
     _log(
         "Training plan: "
         f"epochs={epochs}, patience={patience}, max_train_batches={max_train_batches}, "
         f"max_eval_batches={max_eval_batches}, density_enabled={density_enabled}, "
         f"density_weight={density_weight}, smoothness_enabled={smoothness_enabled}, "
-        f"smoothness_weight={smoothness_weight}"
+        f"smoothness_weight={smoothness_weight}, speed_aux_enabled={speed_aux_enabled}, "
+        f"speed_aux_weight={speed_aux_weight}, speed_aux_type={speed_aux_type}"
     )
     _log(
         "Stability plan: "
@@ -858,6 +1042,7 @@ def main() -> None:
         total_train_data_loss = 0.0
         total_train_density_loss = 0.0
         total_train_smoothness_loss = 0.0
+        total_train_speed_aux_loss = 0.0
         n_train_batches = 0
         bad_steps_epoch = 0
         grad_norm_before_sum = 0.0
@@ -911,10 +1096,23 @@ def main() -> None:
                     )
                 else:
                     smoothness_loss = pred.new_zeros(())
+                if speed_aux_enabled and speed_aux_weight > 0:
+                    speed_aux_loss = _masked_speed_aux_loss(
+                        pred_norm=pred,
+                        target_norm=batch["y"],
+                        mask=batch["mask"],
+                        target_mean=stats["target_mean"],
+                        target_std=stats["target_std"],
+                        loss_type=speed_aux_type,
+                        huber_delta=speed_aux_huber_delta,
+                    )
+                else:
+                    speed_aux_loss = pred.new_zeros(())
                 loss = (
                     data_loss
                     + density_weight * density_loss
                     + smoothness_weight * smoothness_loss
+                    + speed_aux_weight * speed_aux_loss
                 )
 
             if nan_guard_enabled and not torch.isfinite(loss.detach()).all():
@@ -1001,6 +1199,7 @@ def main() -> None:
             total_train_data_loss += float(data_loss.item())
             total_train_density_loss += float(density_loss.item())
             total_train_smoothness_loss += float(smoothness_loss.item())
+            total_train_speed_aux_loss += float(speed_aux_loss.item())
             n_train_batches += 1
             if n_train_batches % 200 == 0:
                 _log(
@@ -1014,6 +1213,7 @@ def main() -> None:
         train_data_loss = total_train_data_loss / max(n_train_batches, 1)
         train_density_loss = total_train_density_loss / max(n_train_batches, 1)
         train_smoothness_loss = total_train_smoothness_loss / max(n_train_batches, 1)
+        train_speed_aux_loss = total_train_speed_aux_loss / max(n_train_batches, 1)
 
         if ema_model is not None and ema_eval_with:
             ema_backup = ema_model.apply_to(model)
@@ -1026,6 +1226,7 @@ def main() -> None:
                     target_std=stats["target_std"],
                     nrmse_denom=stats["nrmse_denom"],
                     input_feature_cfg=input_feature_cfg,
+                    speed_bucket_edges=speed_bucket_edges,
                     max_batches=max_eval_batches,
                 )
             finally:
@@ -1039,8 +1240,15 @@ def main() -> None:
                 target_std=stats["target_std"],
                 nrmse_denom=stats["nrmse_denom"],
                 input_feature_cfg=input_feature_cfg,
+                speed_bucket_edges=speed_bucket_edges,
                 max_batches=max_eval_batches,
             )
+
+        _log_bucket_eval_metrics(
+            metrics=dev_metrics,
+            bucket_edges=speed_bucket_edges,
+            prefix=f"Epoch {epoch} dev",
+        )
 
         monitor_value = _get_monitor_value(dev_metrics, scheduler_monitor)
         scheduler_action = "disabled"
@@ -1067,6 +1275,8 @@ def main() -> None:
             "density_consistency_weight": density_weight,
             "train_smoothness_loss": train_smoothness_loss,
             "smoothness_weight": smoothness_weight,
+            "train_speed_aux_loss": train_speed_aux_loss,
+            "speed_aux_weight": speed_aux_weight,
             "train_grad_norm_before_clip": grad_norm_before_sum / max(grad_norm_count, 1),
             "train_grad_norm_after_clip": grad_norm_after_sum / max(grad_norm_count, 1),
             "bad_steps_epoch": bad_steps_epoch,
@@ -1080,6 +1290,16 @@ def main() -> None:
             "dev_nrmse_sss": dev_metrics["nrmse_sss"],
             "dev_nrmse_speed": dev_metrics["nrmse_speed"],
         }
+        for bucket_i in range(int(speed_bucket_edges.size) + 1):
+            row[f"dev_speed_bucket_{bucket_i}_samples"] = float(
+                dev_metrics.get(f"speed_bucket_{bucket_i}_samples", 0.0)
+            )
+            row[f"dev_speed_bucket_{bucket_i}_rmse"] = float(
+                dev_metrics.get(f"speed_bucket_{bucket_i}_rmse", float("nan"))
+            )
+            row[f"dev_speed_bucket_{bucket_i}_nrmse"] = float(
+                dev_metrics.get(f"speed_bucket_{bucket_i}_nrmse", float("nan"))
+            )
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(json.dumps(row, ensure_ascii=False))
@@ -1153,6 +1373,7 @@ def main() -> None:
                 target_std=stats["target_std"],
                 nrmse_denom=stats["nrmse_denom"],
                 input_feature_cfg=input_feature_cfg,
+                speed_bucket_edges=speed_bucket_edges,
                 max_batches=max_eval_batches,
             )
         finally:
@@ -1166,6 +1387,7 @@ def main() -> None:
             target_std=stats["target_std"],
             nrmse_denom=stats["nrmse_denom"],
             input_feature_cfg=input_feature_cfg,
+            speed_bucket_edges=speed_bucket_edges,
             max_batches=max_eval_batches,
         )
 

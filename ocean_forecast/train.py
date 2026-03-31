@@ -7,11 +7,11 @@ import hashlib
 import json
 from pathlib import Path
 import time
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .config import load_config, save_config
 from .data.dataset import (
@@ -324,6 +324,137 @@ def _refs_to_indices(refs: List[FrameRef], ref_map: Dict[int, int]) -> np.ndarra
     return np.asarray([ref_map[int(r.hour_index)] for r in refs], dtype=np.int64)
 
 
+def _validate_speed_rebalance_config(speed_rebalance_cfg: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, str]:
+    stat = str(speed_rebalance_cfg.get("stat", "future_ocean_mean"))
+    if stat != "future_ocean_mean":
+        raise ValueError(
+            f"Unsupported train.speed_rebalance.stat='{stat}'. "
+            "Only 'future_ocean_mean' is supported."
+        )
+
+    bin_edges = np.asarray(
+        speed_rebalance_cfg.get("bin_edges", [0.1, 0.2, 0.4]),
+        dtype=np.float64,
+    )
+    if bin_edges.ndim != 1 or bin_edges.size == 0:
+        raise ValueError("train.speed_rebalance.bin_edges must be a non-empty 1D array.")
+    if not np.isfinite(bin_edges).all():
+        raise ValueError("train.speed_rebalance.bin_edges must contain finite values.")
+    if not np.all(np.diff(bin_edges) > 0):
+        raise ValueError("train.speed_rebalance.bin_edges must be strictly increasing.")
+
+    bin_weights = np.asarray(
+        speed_rebalance_cfg.get("bin_weights", [1.0, 1.5, 2.5, 4.0]),
+        dtype=np.float64,
+    )
+    expected_weights = int(bin_edges.size) + 1
+    if bin_weights.ndim != 1 or int(bin_weights.size) != expected_weights:
+        raise ValueError(
+            "train.speed_rebalance.bin_weights size mismatch: "
+            f"expected {expected_weights}, got {int(bin_weights.size)}."
+        )
+    if not np.isfinite(bin_weights).all():
+        raise ValueError("train.speed_rebalance.bin_weights must contain finite values.")
+    if np.any(bin_weights <= 0):
+        raise ValueError("train.speed_rebalance.bin_weights must be > 0.")
+
+    return bin_edges.astype(np.float32), bin_weights.astype(np.float32), stat
+
+
+def _assign_speed_bins(speed_gt: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    speed_arr = np.asarray(speed_gt, dtype=np.float64)
+    edges_arr = np.asarray(bin_edges, dtype=np.float64)
+    return np.digitize(speed_arr, bins=edges_arr, right=False).astype(np.int64)
+
+
+def _compute_ref_ocean_mean_speed(reader: Any, refs: List[FrameRef]) -> np.ndarray:
+    ref_speed = np.zeros((len(refs),), dtype=np.float32)
+    for idx, ref in enumerate(refs):
+        frame, mask = reader.read_frame(ref)
+        if int(frame.shape[0]) < 4:
+            raise ValueError(f"Expected frame with >=4 channels for speed calculation, got shape={frame.shape}.")
+        speed = np.sqrt(np.square(frame[2]) + np.square(frame[3]))
+        valid = mask & np.isfinite(speed)
+        if np.any(valid):
+            ref_speed[idx] = float(np.mean(speed[valid], dtype=np.float64))
+    return ref_speed
+
+
+def _compute_future_window_mean_speed(
+    ref_speed: np.ndarray,
+    window_starts: np.ndarray,
+    input_len: int,
+    pred_len: int,
+) -> np.ndarray:
+    if int(pred_len) <= 0:
+        raise ValueError(f"pred_len must be > 0, got {pred_len}.")
+    speed_arr = np.asarray(ref_speed, dtype=np.float64)
+    starts = np.asarray(window_starts, dtype=np.int64)
+
+    future_starts = starts + int(input_len)
+    future_ends = future_starts + int(pred_len)
+    if future_starts.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if int(np.min(future_starts)) < 0 or int(np.max(future_ends)) > int(speed_arr.size):
+        raise ValueError(
+            "Window index out of range while building speed rebalance weights: "
+            f"future range [{int(np.min(future_starts))}, {int(np.max(future_ends))}) "
+            f"for ref_speed size={int(speed_arr.size)}."
+        )
+
+    prefix = np.concatenate(([0.0], np.cumsum(speed_arr, dtype=np.float64)))
+    sums = prefix[future_ends] - prefix[future_starts]
+    means = sums / float(pred_len)
+    return means.astype(np.float32)
+
+
+def _speed_bucket_labels(bin_edges: np.ndarray) -> List[str]:
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    labels = [f"<{edges[0]:g}"]
+    labels.extend(f"{edges[i]:g}-{edges[i + 1]:g}" for i in range(int(edges.size) - 1))
+    labels.append(f">={edges[-1]:g}")
+    return labels
+
+
+def _build_train_speed_rebalance_sampler(
+    reader: Any,
+    train_refs: List[FrameRef],
+    train_windows: np.ndarray,
+    input_len: int,
+    pred_len: int,
+    speed_rebalance_cfg: Dict[str, Any],
+) -> tuple[WeightedRandomSampler | None, Dict[str, Any]]:
+    enabled = bool(speed_rebalance_cfg.get("enabled", True))
+    if not enabled:
+        return None, {"enabled": False}
+
+    bin_edges, bin_weights, stat = _validate_speed_rebalance_config(speed_rebalance_cfg)
+    ref_speed = _compute_ref_ocean_mean_speed(reader=reader, refs=train_refs)
+    speed_gt = _compute_future_window_mean_speed(
+        ref_speed=ref_speed,
+        window_starts=np.asarray(train_windows, dtype=np.int64),
+        input_len=input_len,
+        pred_len=pred_len,
+    )
+    bucket_idx = _assign_speed_bins(speed_gt=speed_gt, bin_edges=bin_edges)
+    sample_weights = bin_weights[bucket_idx].astype(np.float64, copy=False)
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=int(sample_weights.size),
+        replacement=True,
+    )
+    bucket_counts = np.bincount(bucket_idx, minlength=int(bin_weights.size)).astype(np.int64, copy=False)
+    return sampler, {
+        "enabled": True,
+        "stat": stat,
+        "bin_edges": bin_edges,
+        "bin_weights": bin_weights,
+        "speed_gt": speed_gt,
+        "bucket_idx": bucket_idx,
+        "bucket_counts": bucket_counts,
+    }
+
+
 def _resolve_or_build_experiment_artifacts(base_root: Path, data_cfg: Dict) -> Path:
     exp_hash = _artifact_hash(data_cfg)
     exp_root = base_root / ".exp_cache" / exp_hash
@@ -515,10 +646,42 @@ def main() -> None:
         f"train={len(train_ds)}, dev={len(dev_ds)}, test={len(test_ds)}"
     )
 
+    speed_rebalance_cfg = train_cfg.get("speed_rebalance", {}) or {}
+    train_sampler, speed_rebalance_meta = _build_train_speed_rebalance_sampler(
+        reader=reader,
+        train_refs=split.train_main,
+        train_windows=train_windows,
+        input_len=input_len,
+        pred_len=pred_len,
+        speed_rebalance_cfg=speed_rebalance_cfg,
+    )
+    shuffle_train = bool(train_cfg.get("shuffle_train", False)) if train_sampler is None else False
+    if bool(speed_rebalance_meta.get("enabled", False)):
+        bin_edges = np.asarray(speed_rebalance_meta["bin_edges"], dtype=np.float64)
+        bin_weights = np.asarray(speed_rebalance_meta["bin_weights"], dtype=np.float64)
+        bucket_counts = np.asarray(speed_rebalance_meta["bucket_counts"], dtype=np.int64)
+        bucket_labels = _speed_bucket_labels(bin_edges)
+        total_windows = int(bucket_counts.sum())
+        _log(
+            "Speed rebalance enabled: "
+            f"stat={speed_rebalance_meta['stat']}, bin_edges={bin_edges.tolist()}, "
+            f"bin_weights={bin_weights.tolist()}, replacement=True, num_samples={len(train_ds)}"
+        )
+        for idx, label in enumerate(bucket_labels):
+            count = int(bucket_counts[idx])
+            ratio = (100.0 * float(count) / max(total_windows, 1))
+            _log(
+                f"Speed bucket {label}: count={count}, ratio={ratio:.2f}%, "
+                f"sample_weight={float(bin_weights[idx]):.4g}"
+            )
+    else:
+        _log(f"Speed rebalance disabled: using shuffle_train={shuffle_train}")
+
     train_loader = DataLoader(
         train_ds,
         batch_size=int(train_cfg["batch_size"]),
-        shuffle=bool(train_cfg.get("shuffle_train", False)),
+        shuffle=shuffle_train,
+        sampler=train_sampler,
         num_workers=int(train_cfg.get("num_workers", 0)),
         pin_memory=(device.type == "cuda"),
     )

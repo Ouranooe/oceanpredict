@@ -76,6 +76,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "weight": 0.0,
             "channels": ["sst", "sss", "speed"],
         },
+        "speed_rebalance": {
+            "enabled": True,
+            "bin_edges": [0.1, 0.2, 0.4],
+            "bin_weights": [1.0, 1.5, 2.5, 4.0],
+            "stat": "future_ocean_mean",
+        },
         "stability": {
             "grad_clip": {
                 "enabled": True,

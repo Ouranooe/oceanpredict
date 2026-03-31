@@ -19,17 +19,23 @@ from .input_features import (
     compute_model_input_channels,
     parse_input_feature_config,
 )
-from .metrics import MaskedChannelRMSE, rmse_to_nrmse, summarize_channel_metrics
+from .metrics import (
+    EVAL_CHANNEL_NAMES,
+    MaskedChannelRMSE,
+    rmse_to_nrmse,
+    summarize_channel_metrics,
+    to_eval_channels_numpy,
+)
 from .models.registry import build_model
 from .utils import resolve_device
 
-CHANNEL_NAMES = ("sst", "sss", "speed")
+CHANNEL_NAMES = EVAL_CHANNEL_NAMES
 
 
-def _build_model_kwargs(model_cfg: Dict, pred_len: int, input_channels: int) -> Dict:
+def _build_model_kwargs(model_cfg: Dict, pred_len: int, input_channels: int, output_channels: int) -> Dict:
     kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
     kwargs["input_channels"] = int(input_channels)
-    kwargs["output_channels"] = 3
+    kwargs["output_channels"] = int(output_channels)
     kwargs["default_pred_len"] = int(pred_len)
     return kwargs
 
@@ -68,9 +74,7 @@ def _try_collect_ground_truth(
     gt_frames = []
     for hour in forecast_hours:
         frame, _ = reader.read_frame(ref_map[int(hour)])  # type: ignore[attr-defined]
-        speed = np.sqrt(np.square(frame[2]) + np.square(frame[3]))
-        target = np.stack([frame[0], frame[1], speed], axis=0).astype(np.float32)
-        gt_frames.append(target)
+        gt_frames.append(frame[:4].astype(np.float32))
 
     gt_raw = np.stack(gt_frames, axis=0).astype(np.float32)
     gt_raw = np.where(ocean_mask[None, None, :, :], gt_raw, np.nan).astype(np.float32)
@@ -90,9 +94,11 @@ def _compute_metrics_payload(
             "metrics_unavailable_reason": reason_if_unavailable,
         }
 
+    pred_eval = to_eval_channels_numpy(pred_raw)
+    gt_eval = to_eval_channels_numpy(gt_raw)
     meter = MaskedChannelRMSE(n_channels=3)
-    pred_t = torch.from_numpy(pred_raw).unsqueeze(0).to(torch.float32)
-    gt_t = torch.from_numpy(gt_raw).unsqueeze(0).to(torch.float32)
+    pred_t = torch.from_numpy(pred_eval).unsqueeze(0).to(torch.float32)
+    gt_t = torch.from_numpy(gt_eval).unsqueeze(0).to(torch.float32)
     mask_t = torch.from_numpy(ocean_mask.astype(np.float32)).unsqueeze(0)
     meter.update(pred_t, gt_t, mask_t)
 
@@ -334,6 +340,15 @@ def main() -> None:
     input_std = np.maximum(stats["input_std"].astype(np.float32), 1e-6)
     target_mean = stats["target_mean"].astype(np.float32)
     target_std = np.maximum(stats["target_std"].astype(np.float32), 1e-6)
+    target_channels = int(target_mean.shape[0])
+    if target_channels not in (3, 4):
+        raise ValueError(
+            f"Unsupported target_channels={target_channels} from stats. Expected 3 (legacy) or 4 (uv)."
+        )
+    print(
+        f"Inference target mode: channels={target_channels}, "
+        f"mode={'uv' if target_channels == 4 else 'legacy_speed'}"
+    )
     ocean_mask = stats["ocean_mask"].astype(np.float32) > 0.5
 
     x = (x_raw - input_mean[None, :, None, None]) / input_std[None, :, None, None]
@@ -348,7 +363,12 @@ def main() -> None:
 
     model = build_model(
         model_name=model_cfg["name"],
-        **_build_model_kwargs(model_cfg, pred_len, model_input_channels),
+        **_build_model_kwargs(
+            model_cfg,
+            pred_len,
+            model_input_channels,
+            output_channels=target_channels,
+        ),
     )
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
@@ -359,10 +379,12 @@ def main() -> None:
     pred_norm = pred_norm.squeeze(0).cpu().numpy().astype(np.float32)
     pred_raw = pred_norm * target_std[None, :, None, None] + target_mean[None, :, None, None]
     pred_raw = np.where(ocean_mask[None, None, :, :], pred_raw, np.nan).astype(np.float32)
+    pred_eval = to_eval_channels_numpy(pred_raw)
 
     lat = stats["lat"].astype(np.float32)
     lon = stats["lon"].astype(np.float32)
     gt_raw, missing_reason = _try_collect_ground_truth(reader, ref_map, forecast_hours, ocean_mask)
+    gt_eval = to_eval_channels_numpy(gt_raw) if gt_raw is not None else None
     metrics_payload = _compute_metrics_payload(
         pred_raw=pred_raw,
         gt_raw=gt_raw,
@@ -373,8 +395,8 @@ def main() -> None:
 
     viz_dir = Path(args.viz_dir)
     image_paths = _save_visualizations(
-        pred_raw=pred_raw,
-        gt_raw=gt_raw,
+        pred_raw=pred_eval,
+        gt_raw=gt_eval,
         forecast_hours=forecast_hours,
         start_hour=start_hour,
         start_time=start_time,
@@ -401,6 +423,7 @@ def main() -> None:
 
     summary = {
         "shape": list(pred_raw.shape),
+        "eval_shape": list(pred_eval.shape),
         "device": str(device),
         "start_time": str(start_time),
         "pred_len": pred_len,

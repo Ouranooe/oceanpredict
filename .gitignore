@@ -1,3 +1,7 @@
 *.pyc
 *.png
 outputs
+*.npy
+*.zip
+__pycache__/
+*.npz

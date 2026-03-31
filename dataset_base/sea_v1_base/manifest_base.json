@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "task": "sea_forecast",
+  "format": "base_v1",
+  "source_root": "/home/houyi/system/海域要素预测",
+  "years": [
+    1994,
+    1995,
+    1996,
+    1997,
+    1998,
+    1999,
+    2000,
+    2001,
+    2002,
+    2003,
+    2004,
+    2005,
+    2006,
+    2007,
+    2008,
+    2009,
+    2010,
+    2011,
+    2012,
+    2013,
+    2014,
+    2015
+  ],
+  "converted": [
+    {
+      "year": 1994,
+      "frames": 8691
+    },
+    {
+      "year": 1995,
+      "frames": 8699
+    },
+    {
+      "year": 1996,
+      "frames": 8730
+    },
+    {
+      "year": 1997,
+      "frames": 8701
+    },
+    {
+      "year": 1998,
+      "frames": 8626
+    },
+    {
+      "year": 1999,
+      "frames": 8719
+    },
+    {
+      "year": 2000,
+      "frames": 8666
+    },
+    {
+      "year": 2001,
+      "frames": 8717
+    },
+    {
+      "year": 2002,
+      "frames": 8681
+    },
+    {
+      "year": 2003,
+      "frames": 8733
+    },
+    {
+      "year": 2004,
+      "frames": 8746
+    },
+    {
+      "year": 2005,
+      "frames": 8740
+    },
+    {
+      "year": 2006,
+      "frames": 8724
+    },
+    {
+      "year": 2007,
+      "frames": 8717
+    },
+    {
+      "year": 2008,
+      "frames": 8758
+    },
+    {
+      "year": 2009,
+      "frames": 8723
+    },
+    {
+      "year": 2010,
+      "frames": 8726
+    },
+    {
+      "year": 2011,
+      "frames": 8720
+    },
+    {
+      "year": 2012,
+      "frames": 8647
+    },
+    {
+      "year": 2013,
+      "frames": 8618
+    },
+    {
+      "year": 2014,
+      "frames": 8605
+    },
+    {
+      "year": 2015,
+      "frames": 8678
+    }
+  ],
+  "n_refs_global": 191365,
+  "refs_global_file": "refs_global.npz",
+  "lat_file": "lat.npy",
+  "lon_file": "lon.npy"
+}

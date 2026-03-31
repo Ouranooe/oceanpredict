@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from .zip_reader import FrameRef, parse_datetime64
 
 
-TARGET_VARIABLES = ("sst", "sss", "speed")
+TARGET_VARIABLES = ("sst", "sss", "ssu", "ssv")
 
 
 @dataclass
@@ -89,9 +89,12 @@ def compute_normalization_stats(
     in_sq = np.zeros(4, dtype=np.float64)
     in_cnt = np.zeros(4, dtype=np.float64)
 
-    out_sum = np.zeros(3, dtype=np.float64)
-    out_sq = np.zeros(3, dtype=np.float64)
-    out_cnt = np.zeros(3, dtype=np.float64)
+    out_sum = np.zeros(4, dtype=np.float64)
+    out_sq = np.zeros(4, dtype=np.float64)
+    out_cnt = np.zeros(4, dtype=np.float64)
+    speed_sum = 0.0
+    speed_sq = 0.0
+    speed_cnt = 0.0
 
     ocean_mask = None
     for ref in refs:
@@ -99,11 +102,16 @@ def compute_normalization_stats(
         if ocean_mask is None:
             ocean_mask = mask.copy()
 
-        speed = np.sqrt(np.square(frame[2]) + np.square(frame[3]))
-        target = np.stack([frame[0], frame[1], speed], axis=0)
-
         _update_channel_stats(in_sum, in_sq, in_cnt, frame, mask)
-        _update_channel_stats(out_sum, out_sq, out_cnt, target, mask)
+        _update_channel_stats(out_sum, out_sq, out_cnt, frame, mask)
+
+        speed = np.sqrt(np.square(frame[2]) + np.square(frame[3]))
+        valid_speed = mask & np.isfinite(speed)
+        if np.any(valid_speed):
+            vals = speed[valid_speed].astype(np.float64)
+            speed_sum += vals.sum()
+            speed_sq += np.square(vals).sum()
+            speed_cnt += float(vals.size)
 
     if ocean_mask is None:
         raise RuntimeError("No valid frames were found in training range.")
@@ -116,6 +124,9 @@ def compute_normalization_stats(
 
     in_std = np.sqrt(np.maximum(in_var, 1e-12))
     out_std = np.sqrt(np.maximum(out_var, 1e-12))
+    speed_mean = speed_sum / max(speed_cnt, 1.0)
+    speed_var = speed_sq / max(speed_cnt, 1.0) - speed_mean * speed_mean
+    speed_std = float(np.sqrt(max(speed_var, 1e-12)))
 
     lat, lon = reader.get_lat_lon()
     return {
@@ -123,7 +134,7 @@ def compute_normalization_stats(
         "input_std": in_std.astype(np.float32),
         "target_mean": out_mean.astype(np.float32),
         "target_std": out_std.astype(np.float32),
-        "nrmse_denom": out_std.astype(np.float32),
+        "nrmse_denom": np.asarray([out_std[0], out_std[1], speed_std], dtype=np.float32),
         "ocean_mask": ocean_mask.astype(np.float32),
         "lat": lat.astype(np.float32),
         "lon": lon.astype(np.float32),
@@ -161,6 +172,7 @@ class OceanSeqDataset(Dataset):
         self.input_std = stats["input_std"].astype(np.float32)
         self.target_mean = stats["target_mean"].astype(np.float32)
         self.target_std = stats["target_std"].astype(np.float32)
+        self.target_channels = int(self.target_mean.shape[0])
         self.ocean_mask = stats["ocean_mask"].astype(np.float32)
 
     def __len__(self) -> int:
@@ -181,8 +193,15 @@ class OceanSeqDataset(Dataset):
         seq = np.stack(frames, axis=0)  # [Tin+Tout, 4, H, W]
         x_raw = seq[: self.input_len]
         future = seq[self.input_len :]
-        speed = np.sqrt(np.square(future[:, 2]) + np.square(future[:, 3]))
-        y_raw = np.stack([future[:, 0], future[:, 1], speed], axis=1)  # [Tout, 3, H, W]
+        if self.target_channels == 4:
+            y_raw = future[:, :4, :, :]  # [Tout, 4, H, W]
+        elif self.target_channels == 3:
+            speed = np.sqrt(np.square(future[:, 2]) + np.square(future[:, 3]))
+            y_raw = np.stack([future[:, 0], future[:, 1], speed], axis=1)  # [Tout, 3, H, W]
+        else:
+            raise ValueError(
+                f"Unsupported target_channels={self.target_channels}; expected 3 (legacy) or 4 (uv)."
+            )
 
         x = (x_raw - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
         y = (y_raw - self.target_mean[None, :, None, None]) / self.target_std[None, :, None, None]

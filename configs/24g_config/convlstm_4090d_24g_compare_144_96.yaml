@@ -1,15 +1,15 @@
-﻿data:
-  base_root: /home/houyi/system/dataset_base/sea_v1_base
+data:
+  base_root: /root/autodl-tmp/dataset_base/sea_v1
   format: npy_yearly
-  root_dir: /home/houyi/system/dataset_base/sea_v1_base
+  root_dir: /root/autodl-tmp/dataset_base/sea_v1
   train_years:
     - 2010
     - 2011
     - 2012
     - 2013
   test_years: [2014]
-  input_len: 120
-  pred_len: 72
+  input_len: 144
+  pred_len: 96
   stride: 6
   cache_size: 16
   train_start: 2010-01-01T00:00:00
@@ -24,24 +24,23 @@
     add_time_year: true
 
 model:
-  name: tau
-  hidden_dim: 64
+  name: convlstm
+  hidden_dims: [32, 32]
+  kernel_size: 3
   dropout: 0.1
-  max_pred_len: 72
-  tau_block_layers: 0
 
 train:
-  batch_size: 10
-  lr: 0.0005
+  batch_size: 3
+  lr: 0.001
   weight_decay: 0.0001
-  epochs: 100
-  patience: 4
+  epochs: 60
+  patience: 2
   num_workers: 4
   device: cuda
   amp: true
   seed: 42
   shuffle_train: false
-  output_dir: outputs/compare_24g/tau
+  output_dir: outputs/compare_24g/convlstm_144_96
   max_train_batches:
   max_eval_batches:
   density_physics_loss:
@@ -66,4 +65,3 @@ train:
     enabled: false
     weight: 0.0
     channels: [sst, sss, speed]
-

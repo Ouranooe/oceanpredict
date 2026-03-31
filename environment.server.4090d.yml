@@ -1,4 +1,4 @@
-name: ocean4090d
+name: ocean
 channels:
   - pytorch
   - nvidia

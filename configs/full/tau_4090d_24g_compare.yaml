@@ -1,18 +1,20 @@
 ﻿data:
-  base_root: dataset_base/sea_v1
-  root_dir: dataset/娴峰煙瑕佺礌棰勬祴
+  base_root: /home/houyi/system/dataset_base/sea_v1_base
+  format: npy_yearly
+  root_dir: /home/houyi/system/dataset_base/sea_v1_base
   train_years:
+    - 2010
     - 2011
     - 2012
     - 2013
   test_years: [2014]
-  input_len: 72
+  input_len: 120
   pred_len: 72
   stride: 6
   cache_size: 16
-  train_start: 2011-01-01T00:00:00
-  train_main_end: 2013-10-31T23:00:00
-  dev_start: 2013-11-01T00:00:00
+  train_start: 1994-01-01T00:00:00
+  train_main_end: 2012-12-31T00:00:00
+  dev_start: 2013-01-01T00:00:00
   dev_end: 2013-12-31T23:00:00
   test_start: 2014-01-01T00:00:00
   test_end: 2014-12-31T23:00:00
@@ -25,25 +27,38 @@ model:
   name: tau
   hidden_dim: 64
   dropout: 0.1
-  max_pred_len: 128
+  max_pred_len: 72
   tau_block_layers: 0
 
 train:
-  batch_size: 2
-  lr: 0.001
+  batch_size: 10
+  lr: 0.0005
   weight_decay: 0.0001
-  epochs: 60
+  epochs: 100
   patience: 4
-  num_workers: 2
+  num_workers: 4
   device: cuda
   amp: true
   seed: 42
   shuffle_train: false
-  output_dir: outputs/train_tau_mid_8gb
+  output_dir: outputs/compare_24g/tau
   max_train_batches:
   max_eval_batches:
+  density_physics_loss:
+    enabled: false
+    weight: 0.01
+    rho0: 1027.0
+    alpha: 2.0e-4
+    beta: 7.5e-4
+    t0: 0.0
+    s0: 35.0
+  smoothness_loss:
+    enabled: false
+    weight: 0.0
+    spatial_weight: 1.0
+    temporal_weight: 1.0
   diffdiv_loss:
-    enabled: true
+    enabled: false
     weight: 0.05
     channels: [sst, sss]
     speed_weight: 0.0

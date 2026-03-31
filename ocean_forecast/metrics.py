@@ -6,6 +6,8 @@ from typing import Dict
 import numpy as np
 import torch
 
+EVAL_CHANNEL_NAMES = ("sst", "sss", "speed")
+
 
 @dataclass
 class MaskedChannelRMSE:
@@ -39,6 +41,53 @@ def rmse_to_nrmse(rmse: np.ndarray, nrmse_denom: np.ndarray) -> np.ndarray:
     return np.asarray(rmse, dtype=np.float64) / denom
 
 
+def to_eval_channels_torch(raw: torch.Tensor) -> torch.Tensor:
+    """
+    Convert raw prediction/target channels to evaluation channels [sst, sss, speed].
+    Supports raw channels:
+      - C=3: [sst, sss, speed] (legacy)
+      - C=4: [sst, sss, ssu, ssv] (uv mode)
+    """
+    if raw.dim() != 5:
+        raise ValueError(f"raw must be [B,T,C,H,W], got {tuple(raw.shape)}")
+    c = int(raw.size(2))
+    if c == 3:
+        return raw
+    if c == 4:
+        speed = torch.sqrt(torch.square(raw[:, :, 2]) + torch.square(raw[:, :, 3]))
+        return torch.stack([raw[:, :, 0], raw[:, :, 1], speed], dim=2)
+    raise ValueError(f"Unsupported raw channel count for eval conversion: C={c}. Expected 3 or 4.")
+
+
+def to_eval_channels_numpy(raw: np.ndarray) -> np.ndarray:
+    """
+    Convert raw prediction/target channels to evaluation channels [sst, sss, speed].
+    Supports shapes:
+      - [T,C,H,W]
+      - [B,T,C,H,W]
+    Supports raw channels:
+      - C=3: [sst, sss, speed] (legacy)
+      - C=4: [sst, sss, ssu, ssv] (uv mode)
+    """
+    if raw.ndim == 4:
+        c = int(raw.shape[1])
+        if c == 3:
+            return raw
+        if c == 4:
+            speed = np.sqrt(np.square(raw[:, 2]) + np.square(raw[:, 3])).astype(raw.dtype, copy=False)
+            return np.stack([raw[:, 0], raw[:, 1], speed], axis=1).astype(raw.dtype, copy=False)
+        raise ValueError(f"Unsupported raw channel count for eval conversion: C={c}. Expected 3 or 4.")
+    if raw.ndim == 5:
+        c = int(raw.shape[2])
+        if c == 3:
+            return raw
+        if c == 4:
+            speed = np.sqrt(np.square(raw[:, :, 2]) + np.square(raw[:, :, 3])).astype(raw.dtype, copy=False)
+            return np.stack([raw[:, :, 0], raw[:, :, 1], speed], axis=2).astype(raw.dtype, copy=False)
+        raise ValueError(f"Unsupported raw channel count for eval conversion: C={c}. Expected 3 or 4.")
+    raise ValueError(f"raw must be [T,C,H,W] or [B,T,C,H,W], got {tuple(raw.shape)}")
+
+
 def summarize_channel_metrics(rmse: np.ndarray, nrmse: np.ndarray) -> Dict[str, float]:
     return {
         "rmse_sst": float(rmse[0]),
@@ -49,4 +98,3 @@ def summarize_channel_metrics(rmse: np.ndarray, nrmse: np.ndarray) -> Dict[str, 
         "nrmse_speed": float(nrmse[2]),
         "nrmse_mean": float(np.mean(nrmse)),
     }
-

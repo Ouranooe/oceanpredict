@@ -35,7 +35,12 @@ from .losses import (
     masked_mse_loss,
     masked_smoothness_loss,
 )
-from .metrics import MaskedChannelRMSE, rmse_to_nrmse, summarize_channel_metrics
+from .metrics import (
+    MaskedChannelRMSE,
+    rmse_to_nrmse,
+    summarize_channel_metrics,
+    to_eval_channels_torch,
+)
 from .models.registry import build_model
 from .utils import resolve_device, set_seed
 
@@ -69,14 +74,41 @@ def evaluate(
     input_feature_cfg: Dict[str, bool],
     max_batches: int | None = None,
 ) -> Dict[str, float]:
+    metrics, _ = evaluate_with_profile(
+        model=model,
+        loader=loader,
+        device=device,
+        target_mean=target_mean,
+        target_std=target_std,
+        nrmse_denom=nrmse_denom,
+        input_feature_cfg=input_feature_cfg,
+        max_batches=max_batches,
+    )
+    return metrics
+
+
+def evaluate_with_profile(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    target_mean: np.ndarray,
+    target_std: np.ndarray,
+    nrmse_denom: np.ndarray,
+    input_feature_cfg: Dict[str, bool],
+    max_batches: int | None = None,
+) -> tuple[Dict[str, float], Dict[str, float]]:
     model.eval()
     meter = MaskedChannelRMSE(n_channels=3)
     total_loss = 0.0
     n_batches = 0
+    n_samples = 0
 
-    mean_t = torch.tensor(target_mean, dtype=torch.float32, device=device).view(1, 1, 3, 1, 1)
-    std_t = torch.tensor(target_std, dtype=torch.float32, device=device).view(1, 1, 3, 1, 1)
+    mean_t = torch.tensor(target_mean, dtype=torch.float32, device=device).view(1, 1, -1, 1, 1)
+    std_t = torch.tensor(target_std, dtype=torch.float32, device=device).view(1, 1, -1, 1, 1)
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+    eval_start = time.perf_counter()
     with torch.no_grad():
         for b_idx, batch in enumerate(loader):
             if max_batches is not None and b_idx >= max_batches:
@@ -92,22 +124,45 @@ def evaluate(
             loss = masked_mse_loss(pred_norm, batch["y"], batch["mask"])
             total_loss += float(loss.item())
             n_batches += 1
+            n_samples += int(batch["y"].shape[0])
 
             pred_raw = pred_norm * std_t + mean_t
             y_raw = batch["y"] * std_t + mean_t
-            meter.update(pred_raw, y_raw, batch["mask"])
+            pred_eval = to_eval_channels_torch(pred_raw)
+            y_eval = to_eval_channels_torch(y_raw)
+            meter.update(pred_eval, y_eval, batch["mask"])
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+    total_eval_seconds = time.perf_counter() - eval_start
 
     rmse = meter.compute_rmse()
     nrmse = rmse_to_nrmse(rmse, nrmse_denom)
     metrics = summarize_channel_metrics(rmse, nrmse)
     metrics["loss"] = total_loss / max(n_batches, 1)
-    return metrics
+    avg_batch_seconds = total_eval_seconds / n_batches if n_batches > 0 else 0.0
+    avg_sample_seconds = total_eval_seconds / n_samples if n_samples > 0 else 0.0
+    samples_per_second = n_samples / total_eval_seconds if total_eval_seconds > 0 and n_samples > 0 else 0.0
+    profile = {
+        "total_eval_seconds": float(total_eval_seconds),
+        "num_eval_batches": int(n_batches),
+        "num_eval_samples": int(n_samples),
+        "avg_batch_seconds": float(avg_batch_seconds),
+        "avg_sample_seconds": float(avg_sample_seconds),
+        "samples_per_second": float(samples_per_second),
+        "windows_per_second": float(samples_per_second),
+    }
+    return metrics, profile
 
 
-def _build_model_kwargs(model_cfg: Dict, pred_len: int, input_channels: int) -> Dict:
+def _build_model_kwargs(
+    model_cfg: Dict,
+    pred_len: int,
+    input_channels: int,
+    output_channels: int,
+) -> Dict:
     kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
     kwargs["input_channels"] = int(input_channels)
-    kwargs["output_channels"] = 3
+    kwargs["output_channels"] = int(output_channels)
     kwargs["default_pred_len"] = int(pred_len)
     return kwargs
 
@@ -246,7 +301,7 @@ def _load_global_refs(base_root: Path) -> List[FrameRef]:
 
 def _artifact_hash(data_cfg: Dict) -> str:
     payload = {
-        "version": "exp_artifact_v1",
+        "version": "exp_artifact_v2_uv_target",
         "train_start": str(data_cfg["train_start"]),
         "train_main_end": str(data_cfg["train_main_end"]),
         "dev_start": str(data_cfg["dev_start"]),
@@ -421,6 +476,12 @@ def main() -> None:
     dev_windows = reader.load_windows("dev")
     test_windows = reader.load_windows("test")
     stats = reader.load_stats()
+    target_channels = int(np.asarray(stats["target_mean"]).shape[0])
+    if target_channels not in (3, 4):
+        raise ValueError(
+            f"Unsupported target_channels={target_channels} from stats. Expected 3 (legacy) or 4 (uv)."
+        )
+    target_mode = "uv" if target_channels == 4 else "legacy_speed"
     input_len = int(manifest.input_len)
     pred_len = int(manifest.pred_len)
     years_text = (
@@ -431,7 +492,8 @@ def main() -> None:
     _log(
         "Loaded prepared artifacts: "
         f"prepared_root={prepared_root}, years={years_text}, "
-        f"input_len={input_len}, pred_len={pred_len}, stride={manifest.stride}"
+        f"input_len={input_len}, pred_len={pred_len}, stride={manifest.stride}, "
+        f"target_channels={target_channels} ({target_mode})"
     )
     _log(
         "Prepared split refs/windows: "
@@ -482,7 +544,12 @@ def main() -> None:
 
     model = build_model(
         model_name=model_cfg["name"],
-        **_build_model_kwargs(model_cfg, pred_len, model_input_channels),
+        **_build_model_kwargs(
+            model_cfg,
+            pred_len,
+            model_input_channels,
+            output_channels=target_channels,
+        ),
     ).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     _log(
@@ -915,7 +982,7 @@ def main() -> None:
         ema_for_test.load_state_dict(best_ema_state)
         ema_backup = ema_for_test.apply_to(model)
         try:
-            test_metrics = evaluate(
+            test_metrics, inference_profile = evaluate_with_profile(
                 model,
                 test_loader,
                 device=device,
@@ -928,7 +995,7 @@ def main() -> None:
         finally:
             ema_for_test.restore(model, ema_backup)
     else:
-        test_metrics = evaluate(
+        test_metrics, inference_profile = evaluate_with_profile(
             model,
             test_loader,
             device=device,
@@ -943,6 +1010,7 @@ def main() -> None:
         "best_dev_loss": float(best.get("dev_metrics", {}).get("loss", best_dev_loss)),
         "best_dev_nrmse_mean": float(best.get("dev_metrics", {}).get("nrmse_mean", float("nan"))),
         "test_metrics": test_metrics,
+        "inference_profile": inference_profile,
         "device": str(device),
         "best_checkpoint": str(best_ckpt),
         "stability": {

@@ -40,11 +40,32 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 
 ```bash
 python train.py --config configs/24g_config/convlstm_4090d_24g_compare.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_96_72.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_96_96.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_120_72.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_120_96.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_144_72.yaml
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_144_96.yaml
 python train.py --config configs/24g_config/tau_4090d_24g_compare.yaml
 python train.py --config configs/24g_config/cnn_transformer_4090d_24g_compare.yaml
 python train.py --config configs/24g_config/cnn_transformer_physics_4090d_24g_compare.yaml
+
+
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_168_72.yaml && \
+python train.py --config configs/24g_config/convlstm_4090d_24g_compare_192_72.yaml
+
 ```
 
 ## Notes
 - These configs already use the new `density_physics_loss` + `smoothness_loss` naming.
 - `diffdiv_loss` and `laplacian_smoothness_loss` remain in config but are not included in the current v1 main loss path.
+
+python scripts/eval_final_from_best.py --config configs/24g_config/convlstm_4090d_24g_compare_168_72.yaml
+python scripts/eval_final_from_best.py --config configs/24g_config/convlstm_4090d_24g_compare_192_72.yaml
+
+python train.py --config configs/24g_config/tau_4090d_24g_compare.yaml
+python train.py --config configs/24g_config/cnn_transformer_4090d_24g_compare.yaml
+python train.py --config configs/24g_config/cnn_transformer_physics_4090d_24g_compare.yaml
+
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/full/cnn_transformer_4090d_24g_compare.yaml && \
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/full/convlstm_4090d_24g_compare_120_72.yaml

@@ -85,4 +85,14 @@ train:
     enabled: false
     weight: 0.0
     channels: [sst, sss, speed]
+  speed_aux_loss:
+    enabled: true
+    weight: 0.2
+    type: huber
+    huber_delta: 0.05
+  stability:
+    scheduler:
+      monitor: dev_nrmse_speed
+    nan_guard:
+      lr_decay_factor: 0.9
 

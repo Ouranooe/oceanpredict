@@ -17,6 +17,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "input_len": 72,
         "pred_len": 72,
         "stride": 1,
+        "train_stride_schedule": [],
         "cache_size": 8,
         "train_start": "1994-01-01T00:00:00",
         "train_main_end": "2013-10-31T23:00:00",

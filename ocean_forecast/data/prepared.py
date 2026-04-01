@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -19,6 +19,8 @@ class PreparedManifest:
     years: List[int]
     train_years: List[int]
     test_years: List[int]
+    train_stride_schedule: List[Dict[str, Any]]
+    train_stride_summary: List[Dict[str, Any]]
 
 
 class PreparedReader:
@@ -57,6 +59,8 @@ class PreparedReader:
             years=years,
             train_years=[int(y) for y in raw_manifest.get("train_years", [])],
             test_years=[int(y) for y in raw_manifest.get("test_years", [])],
+            train_stride_schedule=list(raw_manifest.get("train_stride_schedule", [])),
+            train_stride_summary=list(raw_manifest.get("train_stride_summary", [])),
         )
 
         self._lat = None

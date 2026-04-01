@@ -7,10 +7,12 @@ from torch.utils.data import WeightedRandomSampler
 
 from ocean_forecast.train import (
     _assign_speed_bins,
+    _build_train_windows_with_schedule,
     _build_train_speed_rebalance_sampler,
     _compute_batch_speed_gt_means,
     _compute_future_window_mean_speed,
     _masked_speed_aux_loss,
+    _normalize_train_stride_schedule,
 )
 from ocean_forecast.data.zip_reader import FrameRef
 
@@ -38,6 +40,23 @@ def _make_refs(n: int) -> list[FrameRef]:
                 hour_index=i,
                 zip_path="unused.npy",
                 member_name="2011",
+                time_idx=i,
+            )
+        )
+    return refs
+
+
+def _make_hourly_refs(start: str, n: int) -> list[FrameRef]:
+    base = np.datetime64(start).astype("datetime64[h]")
+    refs: list[FrameRef] = []
+    for i in range(int(n)):
+        ts = base + np.timedelta64(i, "h")
+        refs.append(
+            FrameRef(
+                timestamp=ts,
+                hour_index=int((ts - np.datetime64("2000-01-01T00:00:00")) / np.timedelta64(1, "h")),
+                zip_path="unused.npy",
+                member_name=str(int(str(ts)[:4])),
                 time_idx=i,
             )
         )
@@ -159,3 +178,63 @@ def test_compute_batch_speed_gt_means_matches_masked_average() -> None:
     mask = torch.tensor([[[1.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [1.0, 0.0]]], dtype=torch.float32)
     means = _compute_batch_speed_gt_means(y_eval=y_eval, mask=mask)
     assert np.allclose(means, np.array([0.2, 0.5], dtype=np.float64), atol=1e-6)
+
+
+def test_build_train_windows_with_schedule_matches_default_stride_when_disabled() -> None:
+    refs = _make_hourly_refs("2012-01-01T00:00:00", 10)
+    windows, meta = _build_train_windows_with_schedule(
+        refs=refs,
+        input_len=2,
+        pred_len=2,
+        default_stride=3,
+        schedule_raw=[],
+    )
+    assert windows.tolist() == [0, 3, 6]
+    assert bool(meta["enabled"]) is False
+
+
+def test_build_train_windows_with_schedule_uses_prediction_start_segment_stride() -> None:
+    refs = _make_hourly_refs("2004-12-31T22:00:00", 8)
+    windows, meta = _build_train_windows_with_schedule(
+        refs=refs,
+        input_len=1,
+        pred_len=1,
+        default_stride=99,
+        schedule_raw=[
+            {"start": "2004-12-31T00:00:00", "end": "2004-12-31T23:00:00", "stride": 2},
+            {"start": "2005-01-01T00:00:00", "end": "2005-01-01T23:00:00", "stride": 3},
+        ],
+    )
+    assert windows.tolist() == [0, 2, 4]
+    assert bool(meta["enabled"]) is True
+    assert [seg["num_kept_windows"] for seg in meta["summary"]] == [1, 2]
+
+
+def test_build_train_windows_with_schedule_rejects_uncovered_prediction_times() -> None:
+    refs = _make_hourly_refs("2004-12-31T22:00:00", 8)
+    with pytest.raises(ValueError, match="does not fully cover train prediction-start times"):
+        _build_train_windows_with_schedule(
+            refs=refs,
+            input_len=1,
+            pred_len=1,
+            default_stride=1,
+            schedule_raw=[
+                {"start": "2004-12-31T00:00:00", "end": "2004-12-31T23:00:00", "stride": 2},
+            ],
+        )
+
+
+def test_normalize_train_stride_schedule_rejects_overlap_and_bad_stride() -> None:
+    with pytest.raises(ValueError, match="strictly increasing and non-overlapping"):
+        _normalize_train_stride_schedule(
+            [
+                {"start": "2010-01-01T00:00:00", "end": "2010-12-31T23:00:00", "stride": 6},
+                {"start": "2010-12-31T23:00:00", "end": "2011-12-31T23:00:00", "stride": 3},
+            ]
+        )
+    with pytest.raises(ValueError, match="stride must be > 0"):
+        _normalize_train_stride_schedule(
+            [
+                {"start": "2010-01-01T00:00:00", "end": "2010-12-31T23:00:00", "stride": 0},
+            ]
+        )

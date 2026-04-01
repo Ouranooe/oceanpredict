@@ -24,7 +24,7 @@ from .data.dataset import (
 )
 from .data.npy_reader import NpyYearReader
 from .data.prepared import PreparedReader
-from .data.zip_reader import FrameRef, hour_index_to_datetime
+from .data.zip_reader import FrameRef, hour_index_to_datetime, parse_datetime64
 from .input_features import (
     BASE_INPUT_CHANNELS,
     augment_input_tensor,
@@ -345,6 +345,9 @@ def _load_global_refs(base_root: Path) -> List[FrameRef]:
 
 
 def _artifact_hash(data_cfg: Dict) -> str:
+    train_stride_schedule = _serialize_train_stride_schedule(
+        _normalize_train_stride_schedule(data_cfg.get("train_stride_schedule", []))
+    )
     payload = {
         "version": "exp_artifact_v2_uv_target",
         "train_start": str(data_cfg["train_start"]),
@@ -356,6 +359,7 @@ def _artifact_hash(data_cfg: Dict) -> str:
         "input_len": int(data_cfg["input_len"]),
         "pred_len": int(data_cfg["pred_len"]),
         "stride": int(data_cfg.get("stride", 1)),
+        "train_stride_schedule": train_stride_schedule,
     }
     text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
@@ -367,6 +371,140 @@ def _build_ref_index_map(refs: List[FrameRef]) -> Dict[int, int]:
 
 def _refs_to_indices(refs: List[FrameRef], ref_map: Dict[int, int]) -> np.ndarray:
     return np.asarray([ref_map[int(r.hour_index)] for r in refs], dtype=np.int64)
+
+
+def _normalize_train_stride_schedule(schedule_raw: Any) -> List[Dict[str, Any]]:
+    if schedule_raw is None:
+        return []
+    if not isinstance(schedule_raw, list):
+        raise ValueError("data.train_stride_schedule must be a list of {start, end, stride} entries.")
+
+    schedule: List[Dict[str, Any]] = []
+    prev_end: np.datetime64 | None = None
+    for idx, item in enumerate(schedule_raw):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"data.train_stride_schedule[{idx}] must be a mapping with keys 'start', 'end', 'stride'."
+            )
+        if "start" not in item or "end" not in item or "stride" not in item:
+            raise ValueError(
+                f"data.train_stride_schedule[{idx}] must contain 'start', 'end', and 'stride'."
+            )
+        start_text = str(item["start"])
+        end_text = str(item["end"])
+        start = parse_datetime64(start_text)
+        end = parse_datetime64(end_text)
+        stride = int(item["stride"])
+        if end < start:
+            raise ValueError(
+                f"data.train_stride_schedule[{idx}] has end < start: {start_text} .. {end_text}."
+            )
+        if stride <= 0:
+            raise ValueError(f"data.train_stride_schedule[{idx}].stride must be > 0, got {stride}.")
+        if prev_end is not None and start <= prev_end:
+            raise ValueError(
+                "data.train_stride_schedule must be strictly increasing and non-overlapping."
+            )
+        schedule.append(
+            {
+                "start": start,
+                "end": end,
+                "stride": stride,
+                "start_text": start_text,
+                "end_text": end_text,
+            }
+        )
+        prev_end = end
+    return schedule
+
+
+def _serialize_train_stride_schedule(schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "start": str(seg["start_text"]),
+            "end": str(seg["end_text"]),
+            "stride": int(seg["stride"]),
+        }
+        for seg in schedule
+    ]
+
+
+def _build_train_windows_with_schedule(
+    refs: List[FrameRef],
+    input_len: int,
+    pred_len: int,
+    default_stride: int,
+    schedule_raw: Any,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    schedule = _normalize_train_stride_schedule(schedule_raw)
+    if not schedule:
+        train_windows = np.asarray(
+            build_window_starts(refs, input_len, pred_len, stride=default_stride),
+            dtype=np.int64,
+        )
+        return train_windows, {
+            "enabled": False,
+            "schedule": [],
+            "summary": [],
+        }
+
+    candidate_windows = np.asarray(
+        build_window_starts(refs, input_len, pred_len, stride=1),
+        dtype=np.int64,
+    )
+    if candidate_windows.size == 0:
+        return candidate_windows, {
+            "enabled": True,
+            "schedule": _serialize_train_stride_schedule(schedule),
+            "summary": [],
+        }
+
+    pred_times = np.asarray(
+        [refs[int(start) + int(input_len)].timestamp for start in candidate_windows],
+        dtype="datetime64[h]",
+    )
+    assigned_segment = np.full(candidate_windows.shape, -1, dtype=np.int64)
+    selected_segments: List[np.ndarray] = []
+    summary: List[Dict[str, Any]] = []
+
+    for seg_idx, seg in enumerate(schedule):
+        mask = (pred_times >= seg["start"]) & (pred_times <= seg["end"])
+        assigned_segment[mask] = int(seg_idx)
+        seg_windows = candidate_windows[mask]
+        kept = seg_windows[:: int(seg["stride"])]
+        selected_segments.append(kept.astype(np.int64, copy=False))
+        summary.append(
+            {
+                "start": str(seg["start_text"]),
+                "end": str(seg["end_text"]),
+                "stride": int(seg["stride"]),
+                "num_candidate_windows": int(seg_windows.size),
+                "num_kept_windows": int(kept.size),
+            }
+        )
+
+    if np.any(assigned_segment < 0):
+        uncovered_times = pred_times[assigned_segment < 0]
+        first_uncovered = str(uncovered_times[0].astype("datetime64[h]"))
+        last_uncovered = str(uncovered_times[-1].astype("datetime64[h]"))
+        raise ValueError(
+            "data.train_stride_schedule does not fully cover train prediction-start times: "
+            f"first_uncovered={first_uncovered}, last_uncovered={last_uncovered}, "
+            f"num_uncovered_windows={int(uncovered_times.size)}."
+        )
+
+    if selected_segments:
+        train_windows = np.concatenate(selected_segments).astype(np.int64, copy=False)
+        train_windows = np.unique(train_windows)
+        train_windows.sort()
+    else:
+        train_windows = np.zeros((0,), dtype=np.int64)
+
+    return train_windows, {
+        "enabled": True,
+        "schedule": _serialize_train_stride_schedule(schedule),
+        "summary": summary,
+    }
 
 
 def _validate_speed_bucket_edges(
@@ -646,10 +784,14 @@ def _resolve_or_build_experiment_artifacts(base_root: Path, data_cfg: Dict) -> P
     input_len = int(data_cfg["input_len"])
     pred_len = int(data_cfg["pred_len"])
     stride = int(data_cfg.get("stride", 1))
+    train_stride_schedule = _normalize_train_stride_schedule(data_cfg.get("train_stride_schedule", []))
 
-    train_windows = np.asarray(
-        build_window_starts(split.train_main, input_len, pred_len, stride=stride),
-        dtype=np.int64,
+    train_windows, train_stride_meta = _build_train_windows_with_schedule(
+        refs=split.train_main,
+        input_len=input_len,
+        pred_len=pred_len,
+        default_stride=stride,
+        schedule_raw=train_stride_schedule,
     )
     dev_windows = np.asarray(
         build_window_starts(split.dev, input_len, pred_len, stride=stride),
@@ -691,6 +833,8 @@ def _resolve_or_build_experiment_artifacts(base_root: Path, data_cfg: Dict) -> P
         "input_len": input_len,
         "pred_len": pred_len,
         "stride": stride,
+        "train_stride_schedule": train_stride_meta["schedule"],
+        "train_stride_summary": train_stride_meta["summary"],
         "train_start": str(data_cfg["train_start"]),
         "train_main_end": str(data_cfg["train_main_end"]),
         "dev_start": str(data_cfg["dev_start"]),
@@ -713,6 +857,15 @@ def _resolve_or_build_experiment_artifacts(base_root: Path, data_cfg: Dict) -> P
         f"refs(train/dev/test)={len(split.train_main)}/{len(split.dev)}/{len(split.test)}, "
         f"windows={train_windows.size}/{dev_windows.size}/{test_windows.size}"
     )
+    if bool(train_stride_meta.get("enabled", False)):
+        _log(f"Train stride schedule: {train_stride_meta['schedule']}")
+        for seg in train_stride_meta["summary"]:
+            _log(
+                "Train stride segment: "
+                f"{seg['start']}..{seg['end']}, stride={seg['stride']}, "
+                f"candidate_windows={seg['num_candidate_windows']}, "
+                f"kept_windows={seg['num_kept_windows']}"
+            )
     return exp_root
 
 
@@ -792,6 +945,15 @@ def main() -> None:
         f"input_len={input_len}, pred_len={pred_len}, stride={manifest.stride}, "
         f"target_channels={target_channels} ({target_mode})"
     )
+    if manifest.train_stride_schedule:
+        _log(f"Loaded train stride schedule: {manifest.train_stride_schedule}")
+        for seg in manifest.train_stride_summary:
+            _log(
+                "Loaded train stride segment: "
+                f"{seg['start']}..{seg['end']}, stride={seg['stride']}, "
+                f"candidate_windows={seg['num_candidate_windows']}, "
+                f"kept_windows={seg['num_kept_windows']}"
+            )
     _log(
         "Prepared split refs/windows: "
         f"train_main={len(split.train_main)}/{len(train_windows)}, "

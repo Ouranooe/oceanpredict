@@ -1,0 +1,101 @@
+data:
+  base_root: /home/houyi/system/dataset_base/sea_v1_base
+  format: npy_yearly
+  root_dir: /home/houyi/system/dataset_base/sea_v1_base
+  train_years:
+    - 2010
+    - 2011
+    - 2012
+    - 2013
+  test_years: [2014]
+  input_len: 120
+  pred_len: 72
+  stride: 6
+  train_stride_schedule: []
+  cache_size: 16
+  train_start: 2010-01-01T00:00:00
+  train_main_end: 2012-12-31T00:00:00
+  dev_start: 2013-01-01T00:00:00
+  dev_end: 2013-12-31T23:00:00
+  test_start: 2014-01-01T00:00:00
+  test_end: 2014-12-31T23:00:00
+  input_features:
+    add_mask: true
+    add_time_hour: true
+    add_time_year: true
+
+model:
+  name: cnn_transformer
+  hidden_dim: 64
+  num_heads: 4
+  num_layers: 2
+  ff_dim: 256
+  dropout: 0.1
+  max_input_len: 128
+  max_pred_len: 72
+
+train:
+  batch_size: 16
+  lr: 0.0003
+  weight_decay: 0.0001
+  epochs: 100
+  patience: 4
+  num_workers: 4
+  device: cuda
+  amp: false
+  seed: 42
+  shuffle_train: true
+  output_dir: outputs/full/cnn_transformer_2010_2013_nospeedopt
+  max_train_batches:
+  max_eval_batches:
+  density_physics_loss:
+    enabled: false
+    weight: 0.01
+    rho0: 1027.0
+    alpha: 2.0e-4
+    beta: 7.5e-4
+    t0: 0.0
+    s0: 35.0
+  smoothness_loss:
+    enabled: false
+    weight: 0.0
+    spatial_weight: 1.0
+    temporal_weight: 1.0
+  diffdiv_loss:
+    enabled: false
+    weight: 0.05
+    channels: [sst, sss]
+    speed_weight: 0.0
+  laplacian_smoothness_loss:
+    enabled: false
+    weight: 0.0
+    channels: [sst, sss, speed]
+  speed_aux_loss:
+    enabled: false
+    weight: 0.12
+    type: huber
+    huber_delta: 0.05
+  speed_rebalance:
+    enabled: false
+  stability:
+    grad_clip:
+      enabled: true
+      max_norm: 0.7
+      norm_type: 2.0
+    scheduler:
+      enabled: true
+      type: plateau
+      monitor: dev_loss
+      factor: 0.7
+      patience: 2
+      threshold: 1.0e-4
+      min_lr: 5.0e-6
+      cooldown: 0
+    warmup:
+      enabled: true
+      epochs: 2
+      start_factor: 0.05
+    nan_guard:
+      enabled: true
+      lr_decay_factor: 0.97
+      max_bad_steps_per_epoch: 30

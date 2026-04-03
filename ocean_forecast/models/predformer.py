@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .base import BaseForecaster
 
@@ -244,10 +245,6 @@ class PredFormer(BaseForecaster):
         b, t_in, c_in, h, w = x.shape
         if c_in != self.input_channels:
             raise ValueError(f"input_channels mismatch: expected {self.input_channels}, got {c_in}.")
-        if h % self.patch_size != 0 or w % self.patch_size != 0:
-            raise ValueError(
-                f"Input H/W must be divisible by patch_size={self.patch_size}, got H={h}, W={w}."
-            )
 
         t_out = int(pred_len) if pred_len is not None else self.default_pred_len
         if t_in > self.max_input_len:
@@ -262,7 +259,16 @@ class PredFormer(BaseForecaster):
                 f"size {self.temporal_pos.shape[0]}."
             )
 
-        patch_tokens = self.patch_embed(x.reshape(b * t_in, c_in, h, w))
+        x_btchw = x.reshape(b * t_in, c_in, h, w)
+        pad_h = (-h) % self.patch_size
+        pad_w = (-w) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            # Pad to patch-aligned spatial size, then crop prediction back to original H/W.
+            x_btchw = F.pad(x_btchw, (0, pad_w, 0, pad_h))
+        h_pad = h + pad_h
+        w_pad = w + pad_w
+
+        patch_tokens = self.patch_embed(x_btchw)
         hp, wp = patch_tokens.shape[-2:]
         n_tokens = hp * wp
         patch_tokens = patch_tokens.flatten(2).transpose(1, 2).reshape(b, t_in, n_tokens, self.embed_dim)
@@ -298,8 +304,8 @@ class PredFormer(BaseForecaster):
             b * t_out, self.embed_dim, hp, wp
         )
         pred = self.patch_decode(future)
-        return pred.reshape(b, t_out, self.output_channels, h, w)
+        pred = pred.reshape(b, t_out, self.output_channels, h_pad, w_pad)
+        return pred[:, :, :, :h, :w]
 
 
 PredFormerForecaster = PredFormer
-

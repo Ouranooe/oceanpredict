@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import torch
 
 from ocean_forecast.input_features import (
@@ -252,7 +251,7 @@ def test_predformer_pred_len_override() -> None:
     assert y.shape == (1, 7, 3, 8, 8)
 
 
-def test_predformer_non_divisible_patch_error() -> None:
+def test_predformer_non_divisible_patch_supported() -> None:
     x = torch.randn(1, 5, 4, 7, 8)
     model = PredFormer(
         input_channels=4,
@@ -269,5 +268,5 @@ def test_predformer_non_divisible_patch_error() -> None:
         max_pred_len=16,
         default_pred_len=6,
     )
-    with pytest.raises(ValueError, match="divisible by patch_size"):
-        _ = model(x, pred_len=4)
+    y = model(x, pred_len=4)
+    assert y.shape == (1, 4, 3, 7, 8)

@@ -26,26 +26,26 @@ data:
 
 model:
   name: predformer
-  embed_dim: 128
-  num_heads: 8
-  num_layers: 6
-  mlp_ratio: 4.0
+  embed_dim: 64
+  num_heads: 4
+  num_layers: 3
+  mlp_ratio: 2.0
   dropout: 0.1
   attn_dropout: 0.0
-  patch_size: 4
+  patch_size: 8
   temporal_kernel: binary_ts
   max_input_len: 128
   max_pred_len: 72
 
 train:
-  batch_size: 16
+  batch_size: 4
   lr: 0.0003
   weight_decay: 0.0001
   epochs: 100
   patience: 4
   num_workers: 4
   device: cuda
-  amp: false
+  amp: true
   seed: 42
   shuffle_train: true
   output_dir: outputs/full/predformer_2010_2013_nospeedopt

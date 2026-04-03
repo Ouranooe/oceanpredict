@@ -6,6 +6,7 @@ from typing import Dict, Type
 from .base import BaseForecaster
 from .cnn_transformer import CNNTransformerForecaster
 from .convlstm import ConvLSTMForecaster
+from .predformer import PredFormerForecaster
 from .tau import TAUForecaster
 
 
@@ -15,6 +16,8 @@ MODEL_REGISTRY: Dict[str, Type[BaseForecaster]] = {
     "cnn_transformer": CNNTransformerForecaster,
     "cnn_transformer_phys": CNNTransformerForecaster,
     "cnn_transformer_physics": CNNTransformerForecaster,
+    "predformer": PredFormerForecaster,
+    "pred_former": PredFormerForecaster,
 }
 
 

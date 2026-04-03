@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from ocean_forecast.input_features import (
@@ -16,6 +17,8 @@ from ocean_forecast.losses import (
     masked_temporal_diffdiv_loss,
 )
 from ocean_forecast.models.cnn_transformer import CNNTransformerForecaster
+from ocean_forecast.models.predformer import PredFormer
+from ocean_forecast.models.registry import build_model
 from ocean_forecast.models.tau import TAUForecaster
 
 
@@ -177,3 +180,94 @@ def test_tau_and_cnn_transformer_output_shape_with_augmented_input() -> None:
     )
     y = model(x, pred_len=4)
     assert y.shape == (2, 4, 3, 8, 8)
+
+
+def test_predformer_forward_shape() -> None:
+    feature_cfg = {"add_mask": True, "add_time_hour": True, "add_time_year": True}
+    in_channels = compute_model_input_channels(4, feature_cfg)
+    x = torch.randn(2, 5, in_channels, 8, 8)
+
+    model = PredFormer(
+        input_channels=in_channels,
+        output_channels=3,
+        embed_dim=64,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attn_dropout=0.0,
+        patch_size=4,
+        temporal_kernel="binary_ts",
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+    )
+    y = model(x, pred_len=4)
+    assert y.shape == (2, 4, 3, 8, 8)
+
+
+def test_registry_build_predformer() -> None:
+    feature_cfg = {"add_mask": True, "add_time_hour": True, "add_time_year": True}
+    in_channels = compute_model_input_channels(4, feature_cfg)
+    x = torch.randn(1, 5, in_channels, 8, 8)
+
+    model = build_model(
+        model_name="predformer",
+        input_channels=in_channels,
+        output_channels=3,
+        embed_dim=64,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attn_dropout=0.0,
+        patch_size=4,
+        temporal_kernel="binary_ts",
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+    )
+    y = model(x, pred_len=3)
+    assert y.shape == (1, 3, 3, 8, 8)
+
+
+def test_predformer_pred_len_override() -> None:
+    x = torch.randn(1, 5, 4, 8, 8)
+    model = PredFormer(
+        input_channels=4,
+        output_channels=3,
+        embed_dim=64,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attn_dropout=0.0,
+        patch_size=4,
+        temporal_kernel="binary_ts",
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+    )
+    y = model(x, pred_len=7)
+    assert y.shape == (1, 7, 3, 8, 8)
+
+
+def test_predformer_non_divisible_patch_error() -> None:
+    x = torch.randn(1, 5, 4, 7, 8)
+    model = PredFormer(
+        input_channels=4,
+        output_channels=3,
+        embed_dim=64,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attn_dropout=0.0,
+        patch_size=4,
+        temporal_kernel="binary_ts",
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+    )
+    with pytest.raises(ValueError, match="divisible by patch_size"):
+        _ = model(x, pred_len=4)

@@ -181,6 +181,87 @@ def test_tau_and_cnn_transformer_output_shape_with_augmented_input() -> None:
     assert y.shape == (2, 4, 3, 8, 8)
 
 
+def test_cnn_transformer_probsparse_forward_shape_and_ratio() -> None:
+    x = torch.randn(2, 10, 4, 8, 8)
+    model = CNNTransformerForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=128,
+        dropout=0.0,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+        temporal_attention="probsparse",
+        probsparse_factor=2.0,
+        probsparse_min_k=2,
+    )
+    y = model(x, pred_len=4)
+    assert y.shape == (2, 4, 3, 8, 8)
+    assert 0.0 < float(model.last_sparse_query_ratio) < 1.0
+
+
+def test_cnn_transformer_probsparse_short_sequence_fallback() -> None:
+    x = torch.randn(1, 4, 4, 8, 8)
+    model = CNNTransformerForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=128,
+        dropout=0.0,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+        temporal_attention="probsparse",
+        probsparse_factor=2.0,
+        probsparse_min_k=3,
+    )
+    y = model(x, pred_len=3)
+    assert y.shape == (1, 3, 3, 8, 8)
+    assert float(model.last_sparse_query_ratio) >= 0.999
+
+
+def test_cnn_transformer_local_fusion_enabled_shape_and_param_growth() -> None:
+    x = torch.randn(2, 6, 4, 8, 8)
+    base = CNNTransformerForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=128,
+        dropout=0.0,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+    )
+    fused = CNNTransformerForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=128,
+        dropout=0.0,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+        local_fusion_enabled=True,
+        local_dilations=[1, 2],
+        local_fusion_type="film",
+    )
+    params_base = sum(p.numel() for p in base.parameters())
+    params_fused = sum(p.numel() for p in fused.parameters())
+    assert params_fused > params_base
+
+    y = fused(x, pred_len=4)
+    assert y.shape == (2, 4, 3, 8, 8)
+
+
 def test_predformer_forward_shape() -> None:
     feature_cfg = {"add_mask": True, "add_time_hour": True, "add_time_year": True}
     in_channels = compute_model_input_channels(4, feature_cfg)

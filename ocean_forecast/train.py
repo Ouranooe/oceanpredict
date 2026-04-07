@@ -1051,6 +1051,21 @@ def main() -> None:
         "Model ready: "
         f"name={model_cfg['name']}, params={param_count:,}, pred_len={pred_len}"
     )
+    model_temporal_attention = str(getattr(model, "temporal_attention_mode", "full"))
+    model_local_fusion_enabled = bool(getattr(model, "local_fusion_enabled", False))
+    model_local_fusion_type = str(getattr(model, "local_fusion_type", "disabled"))
+    model_local_dilations = list(getattr(model, "local_dilations", []))
+    model_probsparse_factor = float(getattr(model, "probsparse_factor", 0.0))
+    model_probsparse_min_k = int(getattr(model, "probsparse_min_k", 0))
+    _log(
+        "Model detail: "
+        f"temporal_attention={model_temporal_attention}, "
+        f"local_fusion_enabled={model_local_fusion_enabled}, "
+        f"local_fusion_type={model_local_fusion_type}, "
+        f"local_dilations={model_local_dilations}, "
+        f"probsparse_factor={model_probsparse_factor}, "
+        f"probsparse_min_k={model_probsparse_min_k}"
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg["lr"]),
@@ -1212,6 +1227,8 @@ def main() -> None:
         grad_norm_count = 0
         latest_grad_norm_before = 0.0
         latest_grad_norm_after = 0.0
+        probsparse_ratio_sum = 0.0
+        probsparse_ratio_count = 0
 
         for b_idx, batch in enumerate(train_loader):
             if max_train_batches is not None and b_idx >= max_train_batches:
@@ -1234,6 +1251,9 @@ def main() -> None:
                     feature_cfg=input_feature_cfg,
                 )
                 pred = model(x_in)
+                if hasattr(model, "last_sparse_query_ratio"):
+                    probsparse_ratio_sum += float(getattr(model, "last_sparse_query_ratio"))
+                    probsparse_ratio_count += 1
                 data_loss = masked_mse_loss(pred, batch["y"], batch["mask"])
                 if density_enabled and density_weight > 0:
                     density_loss = masked_density_consistency_loss(
@@ -1376,6 +1396,11 @@ def main() -> None:
         train_density_loss = total_train_density_loss / max(n_train_batches, 1)
         train_smoothness_loss = total_train_smoothness_loss / max(n_train_batches, 1)
         train_speed_aux_loss = total_train_speed_aux_loss / max(n_train_batches, 1)
+        train_probsparse_query_ratio = (
+            float(probsparse_ratio_sum / probsparse_ratio_count)
+            if probsparse_ratio_count > 0
+            else float("nan")
+        )
 
         if ema_model is not None and ema_eval_with:
             ema_backup = ema_model.apply_to(model)
@@ -1439,6 +1464,10 @@ def main() -> None:
             "smoothness_weight": smoothness_weight,
             "train_speed_aux_loss": train_speed_aux_loss,
             "speed_aux_weight": speed_aux_weight,
+            "model_temporal_attention": model_temporal_attention,
+            "model_local_fusion_enabled": model_local_fusion_enabled,
+            "model_local_fusion_type": model_local_fusion_type,
+            "train_probsparse_query_ratio": train_probsparse_query_ratio,
             "train_grad_norm_before_clip": grad_norm_before_sum / max(grad_norm_count, 1),
             "train_grad_norm_after_clip": grad_norm_after_sum / max(grad_norm_count, 1),
             "bad_steps_epoch": bad_steps_epoch,

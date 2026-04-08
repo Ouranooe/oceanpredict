@@ -102,7 +102,12 @@ def main() -> None:
 
     model = build_model(
         model_name=model_cfg["name"],
-        **_build_model_kwargs(model_cfg, int(manifest.pred_len), model_input_channels),
+        **_build_model_kwargs(
+            model_cfg,
+            int(manifest.pred_len),
+            model_input_channels,
+            output_channels=int(stats["target_mean"].shape[0]),
+        ),
     ).to(device)
 
     _log(f"Loading best checkpoint: {best_ckpt}")

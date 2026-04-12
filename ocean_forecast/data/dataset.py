@@ -161,12 +161,20 @@ class OceanSeqDataset(Dataset):
         input_len: int,
         pred_len: int,
         stats: Dict[str, np.ndarray],
+        front_seg_enabled: bool = False,
+        front_seg_quantile: float = 0.9,
     ):
         self.reader = reader
         self.refs = list(refs)
         self.window_starts = list(window_starts)
         self.input_len = int(input_len)
         self.pred_len = int(pred_len)
+        self.front_seg_enabled = bool(front_seg_enabled)
+        self.front_seg_quantile = float(front_seg_quantile)
+        if not (0.0 < self.front_seg_quantile < 1.0):
+            raise ValueError(
+                f"front_seg_quantile must be in (0, 1), got {self.front_seg_quantile}."
+            )
 
         self.input_mean = stats["input_mean"].astype(np.float32)
         self.input_std = stats["input_std"].astype(np.float32)
@@ -174,9 +182,51 @@ class OceanSeqDataset(Dataset):
         self.target_std = stats["target_std"].astype(np.float32)
         self.target_channels = int(self.target_mean.shape[0])
         self.ocean_mask = stats["ocean_mask"].astype(np.float32)
+        self.ocean_mask_bool = self.ocean_mask > 0.5
 
     def __len__(self) -> int:
         return len(self.window_starts)
+
+    @staticmethod
+    def _nan_fill(field: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        valid = np.asarray(mask, dtype=bool) & np.isfinite(field)
+        if np.any(valid):
+            fill = float(np.mean(field[valid], dtype=np.float64))
+        else:
+            fill = 0.0
+        out = np.asarray(field, dtype=np.float32).copy()
+        out[~np.isfinite(out)] = fill
+        out[~np.asarray(mask, dtype=bool)] = fill
+        return out
+
+    @classmethod
+    def _gradient_mag(cls, field: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        filled = cls._nan_fill(field, mask)
+        gy, gx = np.gradient(filled)
+        mag = np.sqrt(np.square(gx) + np.square(gy)).astype(np.float32, copy=False)
+        mag[~np.asarray(mask, dtype=bool)] = np.nan
+        return mag
+
+    def _build_front_mask(self, y_raw: np.ndarray) -> np.ndarray:
+        # y_raw: [Tout, C, H, W] in denormalized/raw units.
+        if y_raw.ndim != 4 or y_raw.shape[1] < 2:
+            raise ValueError(
+                f"front mask requires y_raw [T,C,H,W] with C>=2 (sst,sss), got {y_raw.shape}"
+            )
+        mask_t: List[np.ndarray] = []
+        valid_ocean = self.ocean_mask_bool
+        for t in range(y_raw.shape[0]):
+            grad_sst = self._gradient_mag(y_raw[t, 0], valid_ocean)
+            grad_sss = self._gradient_mag(y_raw[t, 1], valid_ocean)
+            signal = np.maximum(grad_sst, grad_sss).astype(np.float32, copy=False)
+            vals = signal[valid_ocean & np.isfinite(signal)]
+            if vals.size == 0:
+                mask_t.append(np.zeros_like(valid_ocean, dtype=np.float32))
+                continue
+            thr = float(np.quantile(vals, self.front_seg_quantile))
+            front = (signal >= thr) & valid_ocean
+            mask_t.append(front.astype(np.float32, copy=False))
+        return np.stack(mask_t, axis=0)[:, None, :, :]
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         start = self.window_starts[idx]
@@ -210,14 +260,17 @@ class OceanSeqDataset(Dataset):
 
         t_in = np.array(hours[: self.input_len], dtype=np.int64)
         t_out = np.array(hours[self.input_len :], dtype=np.int64)
-
-        return {
+        sample = {
             "x": torch.from_numpy(x),
             "y": torch.from_numpy(y),
             "mask": torch.from_numpy(self.ocean_mask.copy()),
             "t_in": torch.from_numpy(t_in),
             "t_out": torch.from_numpy(t_out),
         }
+        if self.front_seg_enabled:
+            front_mask = self._build_front_mask(y_raw=y_raw).astype(np.float32, copy=False)
+            sample["front_mask"] = torch.from_numpy(front_mask)
+        return sample
 
 
 class PreparedSeqDataset(OceanSeqDataset):

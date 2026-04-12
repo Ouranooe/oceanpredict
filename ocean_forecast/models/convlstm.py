@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -43,6 +43,9 @@ class ConvLSTMForecaster(BaseForecaster):
         kernel_size: int = 3,
         dropout: float = 0.0,
         default_pred_len: int = 72,
+        front_aux_enabled: bool = False,
+        front_aux_hidden_dim: int = 16,
+        front_aux_dropout: float = 0.0,
     ):
         super().__init__()
         if len(hidden_dims) != 2:
@@ -50,6 +53,13 @@ class ConvLSTMForecaster(BaseForecaster):
 
         h1, h2 = int(hidden_dims[0]), int(hidden_dims[1])
         self.default_pred_len = int(default_pred_len)
+        self.front_aux_enabled = bool(front_aux_enabled)
+        self.front_aux_hidden_dim = int(front_aux_hidden_dim)
+        self.front_aux_dropout = float(front_aux_dropout)
+        if self.front_aux_hidden_dim <= 0:
+            raise ValueError(f"front_aux_hidden_dim must be > 0, got {self.front_aux_hidden_dim}.")
+        if self.front_aux_dropout < 0:
+            raise ValueError(f"front_aux_dropout must be >= 0, got {self.front_aux_dropout}.")
 
         self.encoder_cells = nn.ModuleList(
             [
@@ -65,6 +75,16 @@ class ConvLSTMForecaster(BaseForecaster):
         )
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
         self.head = nn.Conv2d(h2, output_channels, kernel_size=1)
+        self.front_head = (
+            nn.Sequential(
+                nn.Conv2d(h2, self.front_aux_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(self.front_aux_dropout) if self.front_aux_dropout > 0 else nn.Identity(),
+                nn.Conv2d(self.front_aux_hidden_dim, 1, kernel_size=1),
+            )
+            if self.front_aux_enabled
+            else None
+        )
 
     @staticmethod
     def _zeros_state(
@@ -79,7 +99,7 @@ class ConvLSTMForecaster(BaseForecaster):
         c = torch.zeros(batch_size, channels, height, width, device=device, dtype=dtype)
         return h, c
 
-    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor | Dict[str, torch.Tensor]:
         if x.dim() != 5:
             raise ValueError(f"Expected x shape [B,T,C,H,W], got {tuple(x.shape)}")
         b, t_in, _, h, w = x.shape
@@ -102,6 +122,7 @@ class ConvLSTMForecaster(BaseForecaster):
         dec_states = [enc_states[0], enc_states[1]]
         dec_input = torch.zeros(b, 1, h, w, device=device, dtype=dtype)
         outputs = []
+        front_outputs = [] if self.front_head is not None else None
 
         for _ in range(t_out):
             z = dec_input
@@ -109,8 +130,17 @@ class ConvLSTMForecaster(BaseForecaster):
                 h_l, c_l = cell(z, dec_states[l])
                 dec_states[l] = (h_l, c_l)
                 z = h_l
-            pred = self.head(self.dropout(z))
+            z_drop = self.dropout(z)
+            pred = self.head(z_drop)
             outputs.append(pred)
+            if front_outputs is not None and self.front_head is not None:
+                front_outputs.append(self.front_head(z_drop))
 
-        return torch.stack(outputs, dim=1)
+        field = torch.stack(outputs, dim=1)
+        if front_outputs is None:
+            return field
+        return {
+            "field": field,
+            "front_mask_logits": torch.stack(front_outputs, dim=1),
+        }
 

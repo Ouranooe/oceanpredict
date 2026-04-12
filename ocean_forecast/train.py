@@ -32,12 +32,14 @@ from .input_features import (
     parse_input_feature_config,
 )
 from .losses import (
+    masked_front_bce_with_logits_loss,
     masked_density_consistency_loss,
     masked_mse_loss,
     masked_smoothness_loss,
 )
 from .metrics import (
     MaskedChannelRMSE,
+    masked_front_iou_from_logits,
     rmse_to_nrmse,
     summarize_channel_metrics,
     to_eval_channels_torch,
@@ -65,6 +67,25 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _unpack_model_output(
+    output: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(output, torch.Tensor):
+        return output, None
+    if isinstance(output, dict):
+        if "field" not in output:
+            raise KeyError("Model output dict must include key 'field'.")
+        field = output["field"]
+        front = output.get("front_mask_logits")
+        if front is not None and not isinstance(front, torch.Tensor):
+            raise TypeError("front_mask_logits must be a torch.Tensor when provided.")
+        return field, front
+    raise TypeError(
+        "Unsupported model output type. Expected Tensor or dict with keys "
+        "'field' and optional 'front_mask_logits'."
+    )
+
+
 def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -74,6 +95,9 @@ def evaluate(
     nrmse_denom: np.ndarray,
     input_feature_cfg: Dict[str, bool],
     speed_bucket_edges: np.ndarray | None = None,
+    front_seg_enabled: bool = False,
+    front_seg_pos_weight: float = 1.0,
+    front_seg_threshold: float = 0.5,
     max_batches: int | None = None,
 ) -> Dict[str, float]:
     metrics, _ = evaluate_with_profile(
@@ -85,6 +109,9 @@ def evaluate(
         nrmse_denom=nrmse_denom,
         input_feature_cfg=input_feature_cfg,
         speed_bucket_edges=speed_bucket_edges,
+        front_seg_enabled=front_seg_enabled,
+        front_seg_pos_weight=front_seg_pos_weight,
+        front_seg_threshold=front_seg_threshold,
         max_batches=max_batches,
     )
     return metrics
@@ -99,11 +126,17 @@ def evaluate_with_profile(
     nrmse_denom: np.ndarray,
     input_feature_cfg: Dict[str, bool],
     speed_bucket_edges: np.ndarray | None = None,
+    front_seg_enabled: bool = False,
+    front_seg_pos_weight: float = 1.0,
+    front_seg_threshold: float = 0.5,
     max_batches: int | None = None,
 ) -> tuple[Dict[str, float], Dict[str, float]]:
     model.eval()
     meter = MaskedChannelRMSE(n_channels=3)
     total_loss = 0.0
+    total_front_seg_loss = 0.0
+    total_front_iou = 0.0
+    n_front_batches = 0
     n_batches = 0
     n_samples = 0
 
@@ -137,9 +170,26 @@ def evaluate_with_profile(
                 mask=batch["mask"],
                 feature_cfg=input_feature_cfg,
             )
-            pred_norm = model(x_in)
+            model_out = model(x_in)
+            pred_norm, front_logits = _unpack_model_output(model_out)
             loss = masked_mse_loss(pred_norm, batch["y"], batch["mask"])
             total_loss += float(loss.item())
+            if front_seg_enabled and front_logits is not None and "front_mask" in batch:
+                front_loss = masked_front_bce_with_logits_loss(
+                    logits=front_logits,
+                    target_mask=batch["front_mask"],
+                    ocean_mask=batch["mask"],
+                    pos_weight=front_seg_pos_weight,
+                )
+                front_iou = masked_front_iou_from_logits(
+                    logits=front_logits,
+                    target_mask=batch["front_mask"],
+                    ocean_mask=batch["mask"],
+                    threshold=front_seg_threshold,
+                )
+                total_front_seg_loss += float(front_loss.item())
+                total_front_iou += float(front_iou)
+                n_front_batches += 1
             n_batches += 1
             n_samples += int(batch["y"].shape[0])
 
@@ -176,6 +226,17 @@ def evaluate_with_profile(
     nrmse = rmse_to_nrmse(rmse, nrmse_denom)
     metrics = summarize_channel_metrics(rmse, nrmse)
     metrics["loss"] = total_loss / max(n_batches, 1)
+    if front_seg_enabled:
+        metrics["front_seg_loss"] = (
+            total_front_seg_loss / max(n_front_batches, 1)
+            if n_front_batches > 0
+            else float("nan")
+        )
+        metrics["front_iou"] = (
+            total_front_iou / max(n_front_batches, 1)
+            if n_front_batches > 0
+            else float("nan")
+        )
     if bucket_edges is not None and bucket_sum_sq is not None and bucket_count is not None and bucket_samples is not None:
         _append_speed_bucket_metrics(
             metrics=metrics,
@@ -966,12 +1027,51 @@ def main() -> None:
     if test_windows.size == 0:
         raise RuntimeError("No test windows found in prepared artifacts.")
 
-    train_ds = PreparedSeqDataset(reader, split.train_main, train_windows, input_len, pred_len, stats)
-    dev_ds = PreparedSeqDataset(reader, split.dev, dev_windows, input_len, pred_len, stats)
-    test_ds = PreparedSeqDataset(reader, split.test, test_windows, input_len, pred_len, stats)
+    front_seg_cfg = train_cfg.get("front_seg_aux", {}) or {}
+    front_seg_enabled = bool(front_seg_cfg.get("enabled", True))
+    front_seg_weight = float(front_seg_cfg.get("weight", 0.1))
+    front_seg_quantile = float(front_seg_cfg.get("quantile", 0.9))
+    front_seg_pos_weight = float(front_seg_cfg.get("pos_weight", 1.0))
+    front_seg_threshold = float(front_seg_cfg.get("threshold", 0.5))
+    if front_seg_weight < 0:
+        raise ValueError(f"train.front_seg_aux.weight must be >= 0, got {front_seg_weight}.")
+    if not (0.0 < front_seg_quantile < 1.0):
+        raise ValueError(
+            f"train.front_seg_aux.quantile must be in (0,1), got {front_seg_quantile}."
+        )
+    if front_seg_pos_weight <= 0:
+        raise ValueError(
+            f"train.front_seg_aux.pos_weight must be > 0, got {front_seg_pos_weight}."
+        )
+    if not (0.0 <= front_seg_threshold <= 1.0):
+        raise ValueError(
+            f"train.front_seg_aux.threshold must be in [0,1], got {front_seg_threshold}."
+        )
+
+    train_ds = PreparedSeqDataset(
+        reader, split.train_main, train_windows, input_len, pred_len, stats,
+        front_seg_enabled=front_seg_enabled,
+        front_seg_quantile=front_seg_quantile,
+    )
+    dev_ds = PreparedSeqDataset(
+        reader, split.dev, dev_windows, input_len, pred_len, stats,
+        front_seg_enabled=front_seg_enabled,
+        front_seg_quantile=front_seg_quantile,
+    )
+    test_ds = PreparedSeqDataset(
+        reader, split.test, test_windows, input_len, pred_len, stats,
+        front_seg_enabled=front_seg_enabled,
+        front_seg_quantile=front_seg_quantile,
+    )
     _log(
         "Datasets ready: "
         f"train={len(train_ds)}, dev={len(dev_ds)}, test={len(test_ds)}"
+    )
+    _log(
+        "Front seg aux config: "
+        f"enabled={front_seg_enabled}, weight={front_seg_weight}, "
+        f"quantile={front_seg_quantile}, pos_weight={front_seg_pos_weight}, "
+        f"threshold={front_seg_threshold}"
     )
 
     speed_rebalance_cfg = train_cfg.get("speed_rebalance", {}) or {}
@@ -1037,10 +1137,18 @@ def main() -> None:
         f"pin_memory={device.type == 'cuda'}"
     )
 
+    model_cfg_for_build = dict(model_cfg)
+    if front_seg_enabled and "front_aux_enabled" not in model_cfg_for_build:
+        model_cfg_for_build["front_aux_enabled"] = True
+        model_cfg["front_aux_enabled"] = True
+        cfg["model"]["front_aux_enabled"] = True
+        save_config(cfg, output_dir / "resolved_config.yaml")
+        _log("Front seg aux enabled: auto-set model.front_aux_enabled=true for dual-head output.")
+
     model = build_model(
-        model_name=model_cfg["name"],
+        model_name=model_cfg_for_build["name"],
         **_build_model_kwargs(
-            model_cfg,
+            model_cfg_for_build,
             pred_len,
             model_input_channels,
             output_channels=target_channels,
@@ -1049,7 +1157,7 @@ def main() -> None:
     param_count = sum(p.numel() for p in model.parameters())
     _log(
         "Model ready: "
-        f"name={model_cfg['name']}, params={param_count:,}, pred_len={pred_len}"
+        f"name={model_cfg_for_build['name']}, params={param_count:,}, pred_len={pred_len}"
     )
     model_temporal_attention = str(getattr(model, "temporal_attention_mode", "full"))
     model_local_fusion_enabled = bool(getattr(model, "local_fusion_enabled", False))
@@ -1200,7 +1308,8 @@ def main() -> None:
         f"max_eval_batches={max_eval_batches}, density_enabled={density_enabled}, "
         f"density_weight={density_weight}, smoothness_enabled={smoothness_enabled}, "
         f"smoothness_weight={smoothness_weight}, speed_aux_enabled={speed_aux_enabled}, "
-        f"speed_aux_weight={speed_aux_weight}, speed_aux_type={speed_aux_type}"
+        f"speed_aux_weight={speed_aux_weight}, speed_aux_type={speed_aux_type}, "
+        f"front_seg_enabled={front_seg_enabled}, front_seg_weight={front_seg_weight}"
     )
     _log(
         "Stability plan: "
@@ -1220,6 +1329,7 @@ def main() -> None:
         total_train_density_loss = 0.0
         total_train_smoothness_loss = 0.0
         total_train_speed_aux_loss = 0.0
+        total_train_front_seg_loss = 0.0
         n_train_batches = 0
         bad_steps_epoch = 0
         grad_norm_before_sum = 0.0
@@ -1250,7 +1360,8 @@ def main() -> None:
                     mask=batch["mask"],
                     feature_cfg=input_feature_cfg,
                 )
-                pred = model(x_in)
+                model_out = model(x_in)
+                pred, front_logits = _unpack_model_output(model_out)
                 if hasattr(model, "last_sparse_query_ratio"):
                     probsparse_ratio_sum += float(getattr(model, "last_sparse_query_ratio"))
                     probsparse_ratio_count += 1
@@ -1290,11 +1401,26 @@ def main() -> None:
                     )
                 else:
                     speed_aux_loss = pred.new_zeros(())
+                if (
+                    front_seg_enabled
+                    and front_seg_weight > 0
+                    and front_logits is not None
+                    and "front_mask" in batch
+                ):
+                    front_seg_loss = masked_front_bce_with_logits_loss(
+                        logits=front_logits,
+                        target_mask=batch["front_mask"],
+                        ocean_mask=batch["mask"],
+                        pos_weight=front_seg_pos_weight,
+                    )
+                else:
+                    front_seg_loss = pred.new_zeros(())
                 loss = (
                     data_loss
                     + density_weight * density_loss
                     + smoothness_weight * smoothness_loss
                     + speed_aux_weight * speed_aux_loss
+                    + front_seg_weight * front_seg_loss
                 )
 
             if nan_guard_enabled and not torch.isfinite(loss.detach()).all():
@@ -1382,6 +1508,7 @@ def main() -> None:
             total_train_density_loss += float(density_loss.item())
             total_train_smoothness_loss += float(smoothness_loss.item())
             total_train_speed_aux_loss += float(speed_aux_loss.item())
+            total_train_front_seg_loss += float(front_seg_loss.item())
             n_train_batches += 1
             if n_train_batches % 200 == 0:
                 _log(
@@ -1396,6 +1523,7 @@ def main() -> None:
         train_density_loss = total_train_density_loss / max(n_train_batches, 1)
         train_smoothness_loss = total_train_smoothness_loss / max(n_train_batches, 1)
         train_speed_aux_loss = total_train_speed_aux_loss / max(n_train_batches, 1)
+        train_front_seg_loss = total_train_front_seg_loss / max(n_train_batches, 1)
         train_probsparse_query_ratio = (
             float(probsparse_ratio_sum / probsparse_ratio_count)
             if probsparse_ratio_count > 0
@@ -1414,6 +1542,9 @@ def main() -> None:
                     nrmse_denom=stats["nrmse_denom"],
                     input_feature_cfg=input_feature_cfg,
                     speed_bucket_edges=speed_bucket_edges,
+                    front_seg_enabled=front_seg_enabled,
+                    front_seg_pos_weight=front_seg_pos_weight,
+                    front_seg_threshold=front_seg_threshold,
                     max_batches=max_eval_batches,
                 )
             finally:
@@ -1428,6 +1559,9 @@ def main() -> None:
                 nrmse_denom=stats["nrmse_denom"],
                 input_feature_cfg=input_feature_cfg,
                 speed_bucket_edges=speed_bucket_edges,
+                front_seg_enabled=front_seg_enabled,
+                front_seg_pos_weight=front_seg_pos_weight,
+                front_seg_threshold=front_seg_threshold,
                 max_batches=max_eval_batches,
             )
 
@@ -1464,6 +1598,8 @@ def main() -> None:
             "smoothness_weight": smoothness_weight,
             "train_speed_aux_loss": train_speed_aux_loss,
             "speed_aux_weight": speed_aux_weight,
+            "train_front_seg_loss": train_front_seg_loss,
+            "front_seg_weight": front_seg_weight,
             "model_temporal_attention": model_temporal_attention,
             "model_local_fusion_enabled": model_local_fusion_enabled,
             "model_local_fusion_type": model_local_fusion_type,
@@ -1480,6 +1616,8 @@ def main() -> None:
             "dev_nrmse_sst": dev_metrics["nrmse_sst"],
             "dev_nrmse_sss": dev_metrics["nrmse_sss"],
             "dev_nrmse_speed": dev_metrics["nrmse_speed"],
+            "dev_front_seg_loss": float(dev_metrics.get("front_seg_loss", float("nan"))),
+            "dev_front_iou": float(dev_metrics.get("front_iou", float("nan"))),
         }
         for bucket_i in range(int(speed_bucket_edges.size) + 1):
             row[f"dev_speed_bucket_{bucket_i}_samples"] = float(
@@ -1565,6 +1703,9 @@ def main() -> None:
                 nrmse_denom=stats["nrmse_denom"],
                 input_feature_cfg=input_feature_cfg,
                 speed_bucket_edges=speed_bucket_edges,
+                front_seg_enabled=front_seg_enabled,
+                front_seg_pos_weight=front_seg_pos_weight,
+                front_seg_threshold=front_seg_threshold,
                 max_batches=max_eval_batches,
             )
         finally:
@@ -1579,6 +1720,9 @@ def main() -> None:
             nrmse_denom=stats["nrmse_denom"],
             input_feature_cfg=input_feature_cfg,
             speed_bucket_edges=speed_bucket_edges,
+            front_seg_enabled=front_seg_enabled,
+            front_seg_pos_weight=front_seg_pos_weight,
+            front_seg_threshold=front_seg_threshold,
             max_batches=max_eval_batches,
         )
 

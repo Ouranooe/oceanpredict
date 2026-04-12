@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch
 from torch import nn
@@ -134,6 +134,9 @@ class PredFormer(BaseForecaster):
         max_input_len: int = 256,
         max_pred_len: int = 256,
         default_pred_len: int = 72,
+        front_aux_enabled: bool = False,
+        front_aux_hidden_dim: int = 16,
+        front_aux_dropout: float = 0.0,
     ):
         super().__init__()
         self.input_channels = int(input_channels)
@@ -147,6 +150,9 @@ class PredFormer(BaseForecaster):
         self.max_pred_len = int(max_pred_len)
         self.default_pred_len = int(default_pred_len)
         self.temporal_kernel = str(temporal_kernel).lower()
+        self.front_aux_enabled = bool(front_aux_enabled)
+        self.front_aux_hidden_dim = int(front_aux_hidden_dim)
+        self.front_aux_dropout = float(front_aux_dropout)
 
         if self.embed_dim <= 0:
             raise ValueError(f"embed_dim must be > 0, got {self.embed_dim}.")
@@ -164,6 +170,10 @@ class PredFormer(BaseForecaster):
             raise ValueError(
                 f"Unsupported temporal_kernel='{temporal_kernel}'. Expected one of: binary_ts, full."
             )
+        if self.front_aux_hidden_dim <= 0:
+            raise ValueError(f"front_aux_hidden_dim must be > 0, got {self.front_aux_hidden_dim}.")
+        if self.front_aux_dropout < 0:
+            raise ValueError(f"front_aux_dropout must be >= 0, got {self.front_aux_dropout}.")
 
         self.patch_embed = nn.Conv2d(
             self.input_channels,
@@ -176,6 +186,21 @@ class PredFormer(BaseForecaster):
             self.output_channels,
             kernel_size=self.patch_size,
             stride=self.patch_size,
+        )
+        self.front_decode = (
+            nn.Sequential(
+                nn.Conv2d(self.embed_dim, self.front_aux_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(self.front_aux_dropout) if self.front_aux_dropout > 0 else nn.Identity(),
+                nn.ConvTranspose2d(
+                    self.front_aux_hidden_dim,
+                    1,
+                    kernel_size=self.patch_size,
+                    stride=self.patch_size,
+                ),
+            )
+            if self.front_aux_enabled
+            else None
         )
         self.history_cond = nn.Sequential(
             nn.LayerNorm(self.embed_dim),
@@ -213,7 +238,7 @@ class PredFormer(BaseForecaster):
         self.final_norm = nn.LayerNorm(self.embed_dim)
         self.final_dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
 
-        self._mask_cache: Dict[Tuple[int, str, str], torch.Tensor] = {}
+        self._mask_cache: dict[Tuple[int, str, str], torch.Tensor] = {}
 
     def _build_temporal_mask(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (int(seq_len), str(device), str(dtype))
@@ -238,7 +263,7 @@ class PredFormer(BaseForecaster):
         self._mask_cache[key] = mask
         return mask
 
-    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor | dict[str, torch.Tensor]:
         if x.dim() != 5:
             raise ValueError(f"Expected x shape [B,T,C,H,W], got {tuple(x.shape)}")
 
@@ -303,9 +328,16 @@ class PredFormer(BaseForecaster):
         future = future.reshape(b * t_out, n_tokens, self.embed_dim).transpose(1, 2).reshape(
             b * t_out, self.embed_dim, hp, wp
         )
-        pred = self.patch_decode(future)
-        pred = pred.reshape(b, t_out, self.output_channels, h_pad, w_pad)
-        return pred[:, :, :, :h, :w]
+        pred = self.patch_decode(future).reshape(b, t_out, self.output_channels, h_pad, w_pad)
+        field = pred[:, :, :, :h, :w]
+        if self.front_decode is None:
+            return field
+        front_logits = self.front_decode(future).reshape(b, t_out, 1, h_pad, w_pad)
+        front_logits = front_logits[:, :, :, :h, :w]
+        return {
+            "field": field,
+            "front_mask_logits": front_logits,
+        }
 
 
 PredFormerForecaster = PredFormer

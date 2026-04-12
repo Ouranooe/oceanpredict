@@ -47,6 +47,19 @@ def _stats_from_checkpoint(ckpt: Dict) -> Dict[str, np.ndarray]:
     return {k: np.asarray(v) for k, v in raw.items()}
 
 
+def _unpack_model_output(output: object) -> torch.Tensor:
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, dict):
+        if "field" not in output:
+            raise KeyError("Model output dict must include key 'field'.")
+        field = output["field"]
+        if not isinstance(field, torch.Tensor):
+            raise TypeError("Model output 'field' must be torch.Tensor.")
+        return field
+    raise TypeError("Unsupported model output type for inference. Expected Tensor or dict with key 'field'.")
+
+
 def _sanitize_time_for_filename(value: str) -> str:
     cleaned = value.replace(":", "").replace(" ", "_")
     cleaned = re.sub(r"[^0-9A-Za-zT_\-]", "", cleaned)
@@ -267,6 +280,9 @@ def main() -> None:
     cfg = load_config(args.config)
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
+    train_cfg = cfg.get("train", {}) or {}
+    front_seg_cfg = train_cfg.get("front_seg_aux", {}) or {}
+    front_seg_enabled = bool(front_seg_cfg.get("enabled", True))
     input_feature_cfg = parse_input_feature_config(data_cfg)
     model_input_channels = compute_model_input_channels(BASE_INPUT_CHANNELS, input_feature_cfg)
     device_cfg = args.device if args.device is not None else cfg["train"]["device"]
@@ -361,10 +377,15 @@ def main() -> None:
     )
     x_tensor = torch.from_numpy(x).unsqueeze(0).to(device=device, dtype=torch.float32)
 
+    model_cfg_for_build = dict(model_cfg)
+    if front_seg_enabled and "front_aux_enabled" not in model_cfg_for_build:
+        model_cfg_for_build["front_aux_enabled"] = True
+        print("Front seg aux enabled: auto-set model.front_aux_enabled=true for inference model build.")
+
     model = build_model(
-        model_name=model_cfg["name"],
+        model_name=model_cfg_for_build["name"],
         **_build_model_kwargs(
-            model_cfg,
+            model_cfg_for_build,
             pred_len,
             model_input_channels,
             output_channels=target_channels,
@@ -375,7 +396,8 @@ def main() -> None:
     model.eval()
 
     with torch.no_grad():
-        pred_norm = model(x_tensor, pred_len=pred_len)  # [1, Tout, 3, H, W]
+        pred_out = model(x_tensor, pred_len=pred_len)
+        pred_norm = _unpack_model_output(pred_out)  # [1, Tout, C, H, W]
     pred_norm = pred_norm.squeeze(0).cpu().numpy().astype(np.float32)
     pred_raw = pred_norm * target_std[None, :, None, None] + target_mean[None, :, None, None]
     pred_raw = np.where(ocean_mask[None, None, :, :], pred_raw, np.nan).astype(np.float32)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Sequence
+from typing import Dict, Iterable, Sequence
 
 import torch
 from torch import nn
@@ -145,6 +145,9 @@ class CNNTransformerForecaster(BaseForecaster):
         local_fusion_enabled: bool = False,
         local_dilations: Iterable[int] = (1, 2),
         local_fusion_type: str = "gated",
+        front_aux_enabled: bool = False,
+        front_aux_hidden_dim: int = 16,
+        front_aux_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -156,6 +159,9 @@ class CNNTransformerForecaster(BaseForecaster):
         self.probsparse_min_k = int(probsparse_min_k)
         self.local_fusion_enabled = bool(local_fusion_enabled)
         self.local_fusion_type = str(local_fusion_type).lower()
+        self.front_aux_enabled = bool(front_aux_enabled)
+        self.front_aux_hidden_dim = int(front_aux_hidden_dim)
+        self.front_aux_dropout = float(front_aux_dropout)
         self._last_sparse_query_ratio = 1.0
 
         if self.hidden_dim % int(num_heads) != 0:
@@ -174,6 +180,10 @@ class CNNTransformerForecaster(BaseForecaster):
             raise ValueError(
                 f"Unsupported local_fusion_type='{local_fusion_type}'. Expected 'gated' or 'film'."
             )
+        if self.front_aux_hidden_dim <= 0:
+            raise ValueError(f"front_aux_hidden_dim must be > 0, got {self.front_aux_hidden_dim}.")
+        if self.front_aux_dropout < 0:
+            raise ValueError(f"front_aux_dropout must be >= 0, got {self.front_aux_dropout}.")
 
         try:
             dilations = [int(d) for d in local_dilations]
@@ -258,12 +268,22 @@ class CNNTransformerForecaster(BaseForecaster):
             nn.GELU(),
             nn.Conv2d(self.hidden_dim, output_channels, kernel_size=1),
         )
+        self.front_head = (
+            nn.Sequential(
+                nn.Conv2d(self.hidden_dim, self.front_aux_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout(self.front_aux_dropout) if self.front_aux_dropout > 0 else nn.Identity(),
+                nn.Conv2d(self.front_aux_hidden_dim, 1, kernel_size=1),
+            )
+            if self.front_aux_enabled
+            else None
+        )
 
     @property
     def last_sparse_query_ratio(self) -> float:
         return float(self._last_sparse_query_ratio)
 
-    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor | Dict[str, torch.Tensor]:
         if x.dim() != 5:
             raise ValueError(f"Expected x shape [B,T,C,H,W], got {tuple(x.shape)}")
 
@@ -324,5 +344,13 @@ class CNNTransformerForecaster(BaseForecaster):
         scale, bias = torch.chunk(film, chunks=2, dim=-1)
         context = context * (1.0 + scale.unsqueeze(-1).unsqueeze(-1)) + bias.unsqueeze(-1).unsqueeze(-1)
 
-        decoded = self.decoder(self.dropout(context.reshape(b * t_out, self.hidden_dim, h, w)))
-        return decoded.reshape(b, t_out, -1, h, w)
+        decoded_in = self.dropout(context.reshape(b * t_out, self.hidden_dim, h, w))
+        decoded = self.decoder(decoded_in)
+        field = decoded.reshape(b, t_out, -1, h, w)
+        if self.front_head is None:
+            return field
+        front_logits = self.front_head(decoded_in).reshape(b, t_out, 1, h, w)
+        return {
+            "field": field,
+            "front_mask_logits": front_logits,
+        }

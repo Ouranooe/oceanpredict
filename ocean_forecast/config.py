@@ -83,6 +83,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "type": "huber",
             "huber_delta": 0.05,
         },
+        "front_seg_aux": {
+            "enabled": True,
+            "weight": 0.1,
+            "quantile": 0.9,
+            "pos_weight": 1.0,
+            "threshold": 0.5,
+        },
         "speed_rebalance": {
             "enabled": True,
             "bin_edges": [0.1, 0.2, 0.4],
@@ -122,6 +129,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "eval_with_ema": True,
             },
         },
+    },
+    "xgboost": {
+        "enabled": True,
+        "lag_steps": 6,
+        "train_row_cap": 2_000_000,
+        "eval_batch_windows": 4,
+        "n_estimators": 500,
+        "max_depth": 8,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "tree_method": "hist",
+        "device": "cpu",
     },
 }
 

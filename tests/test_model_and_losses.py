@@ -9,13 +9,18 @@ from ocean_forecast.input_features import (
     compute_model_input_channels,
 )
 from ocean_forecast.losses import (
+    masked_front_bce_with_logits_loss,
     masked_density_consistency_loss,
     masked_laplacian_smoothness_loss,
     masked_physics_loss,
     masked_smoothness_loss,
     masked_temporal_diffdiv_loss,
 )
+from ocean_forecast.metrics import masked_front_iou_from_logits
+from ocean_forecast.data.dataset import OceanSeqDataset
+from ocean_forecast.data.zip_reader import FrameRef
 from ocean_forecast.models.cnn_transformer import CNNTransformerForecaster
+from ocean_forecast.models.convlstm import ConvLSTMForecaster
 from ocean_forecast.models.predformer import PredFormer
 from ocean_forecast.models.registry import build_model
 from ocean_forecast.models.tau import TAUForecaster
@@ -131,6 +136,35 @@ def test_masked_smoothness_loss_matches_legacy() -> None:
     assert torch.allclose(legacy, smooth)
 
 
+def test_masked_front_bce_with_logits_loss_finite_and_nonnegative() -> None:
+    logits = torch.zeros(2, 3, 1, 4, 5, dtype=torch.float32)
+    target = torch.zeros(2, 3, 1, 4, 5, dtype=torch.float32)
+    target[:, :, :, :2, :2] = 1.0
+    mask = torch.ones(2, 4, 5, dtype=torch.float32)
+    loss = masked_front_bce_with_logits_loss(
+        logits=logits,
+        target_mask=target,
+        ocean_mask=mask,
+        pos_weight=1.5,
+    )
+    assert torch.isfinite(loss)
+    assert float(loss.item()) >= 0.0
+
+
+def test_masked_front_iou_from_logits_perfect_prediction() -> None:
+    target = torch.zeros(1, 2, 1, 3, 3, dtype=torch.float32)
+    target[:, :, :, 1:, 1:] = 1.0
+    logits = torch.where(target > 0.5, torch.full_like(target, 10.0), torch.full_like(target, -10.0))
+    mask = torch.ones(1, 3, 3, dtype=torch.float32)
+    iou = masked_front_iou_from_logits(
+        logits=logits,
+        target_mask=target,
+        ocean_mask=mask,
+        threshold=0.5,
+    )
+    assert np.isclose(iou, 1.0)
+
+
 def test_input_feature_augmentation_tensor_and_array() -> None:
     feature_cfg = {"add_mask": True, "add_time_hour": True, "add_time_year": True}
     x = torch.zeros(2, 3, 4, 4, 5)
@@ -179,6 +213,115 @@ def test_tau_and_cnn_transformer_output_shape_with_augmented_input() -> None:
     )
     y = model(x, pred_len=4)
     assert y.shape == (2, 4, 3, 8, 8)
+
+
+def test_dual_head_output_shapes_for_all_models() -> None:
+    x = torch.randn(2, 5, 4, 8, 8)
+
+    convlstm = ConvLSTMForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dims=(16, 16),
+        default_pred_len=4,
+        front_aux_enabled=True,
+    )
+    tau = TAUForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=32,
+        max_pred_len=16,
+        default_pred_len=6,
+        front_aux_enabled=True,
+    )
+    cnn = CNNTransformerForecaster(
+        input_channels=4,
+        output_channels=3,
+        hidden_dim=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=128,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+        front_aux_enabled=True,
+    )
+    predformer = PredFormer(
+        input_channels=4,
+        output_channels=3,
+        embed_dim=64,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        patch_size=4,
+        max_input_len=16,
+        max_pred_len=16,
+        default_pred_len=6,
+        front_aux_enabled=True,
+    )
+
+    for model in (convlstm, tau, cnn, predformer):
+        out = model(x, pred_len=4)
+        assert isinstance(out, dict)
+        assert out["field"].shape == (2, 4, 3, 8, 8)
+        assert out["front_mask_logits"].shape == (2, 4, 1, 8, 8)
+
+
+class _DummyReaderForFrontMask:
+    def __init__(self, frames: np.ndarray, mask: np.ndarray):
+        self.frames = frames.astype(np.float32)
+        self.mask = mask.astype(bool)
+
+    def read_frame(self, ref: FrameRef):
+        return self.frames[int(ref.time_idx)], self.mask
+
+
+def _make_refs(n: int) -> list[FrameRef]:
+    base = np.datetime64("2010-01-01T00:00:00")
+    refs: list[FrameRef] = []
+    for i in range(n):
+        refs.append(
+            FrameRef(
+                timestamp=base + np.timedelta64(i, "h"),
+                hour_index=i,
+                zip_path="unused.npy",
+                member_name="2010",
+                time_idx=i,
+            )
+        )
+    return refs
+
+
+def test_dataset_front_mask_shape_and_land_zero() -> None:
+    t_total, c, h, w = 6, 4, 4, 5
+    frames = np.zeros((t_total, c, h, w), dtype=np.float32)
+    for t in range(t_total):
+        yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
+        frames[t, 0] = yy + 0.1 * t
+        frames[t, 1] = xx + 0.2 * t
+    ocean_mask = np.ones((h, w), dtype=np.float32)
+    ocean_mask[:, 0] = 0.0
+
+    stats = {
+        "input_mean": np.zeros((4,), dtype=np.float32),
+        "input_std": np.ones((4,), dtype=np.float32),
+        "target_mean": np.zeros((4,), dtype=np.float32),
+        "target_std": np.ones((4,), dtype=np.float32),
+        "ocean_mask": ocean_mask,
+    }
+    ds = OceanSeqDataset(
+        reader=_DummyReaderForFrontMask(frames=frames, mask=ocean_mask > 0.5),
+        refs=_make_refs(t_total),
+        window_starts=[0],
+        input_len=3,
+        pred_len=2,
+        stats=stats,
+        front_seg_enabled=True,
+        front_seg_quantile=0.9,
+    )
+    sample = ds[0]
+    front = sample["front_mask"].numpy()
+    assert front.shape == (2, 1, h, w)
+    assert np.all(front[:, :, :, 0] == 0.0)
 
 
 def test_cnn_transformer_probsparse_forward_shape_and_ratio() -> None:

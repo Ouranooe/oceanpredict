@@ -13,6 +13,13 @@ class _DummyForecastModel(torch.nn.Module):
         return x[:, :, :3, :, :]
 
 
+class _DummyDualHeadForecastModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor):
+        field = x[:, :, :3, :, :]
+        front_logits = torch.zeros(x.size(0), x.size(1), 1, x.size(3), x.size(4), device=x.device, dtype=x.dtype)
+        return {"field": field, "front_mask_logits": front_logits}
+
+
 class _DummySeqDataset(Dataset):
     def __init__(self, num_samples: int, t: int = 4, c_in: int = 4, h: int = 3, w: int = 3):
         self.num_samples = int(num_samples)
@@ -30,6 +37,15 @@ class _DummySeqDataset(Dataset):
         t_in = torch.arange(self.t, dtype=torch.int64)
         mask = torch.ones(self.h, self.w, dtype=torch.float32)
         return {"x": x, "y": y, "t_in": t_in, "mask": mask}
+
+
+class _DummySeqDatasetWithFront(_DummySeqDataset):
+    def __getitem__(self, idx: int):
+        sample = super().__getitem__(idx)
+        front = torch.zeros(self.t, 1, self.h, self.w, dtype=torch.float32)
+        front[:, :, :1, :1] = 1.0
+        sample["front_mask"] = front
+        return sample
 
 
 def test_evaluate_with_profile_returns_expected_keys_and_max_batches() -> None:
@@ -81,3 +97,28 @@ def test_evaluate_with_profile_empty_loader_is_zero_safe() -> None:
     assert profile["avg_sample_seconds"] == 0.0
     assert profile["samples_per_second"] == 0.0
     assert profile["windows_per_second"] == 0.0
+
+
+def test_evaluate_with_profile_dual_head_front_metrics() -> None:
+    model = _DummyDualHeadForecastModel()
+    loader = DataLoader(_DummySeqDatasetWithFront(num_samples=3), batch_size=2, shuffle=False)
+    input_feature_cfg = {"add_mask": False, "add_time_hour": False, "add_time_year": False}
+
+    metrics, profile = evaluate_with_profile(
+        model=model,
+        loader=loader,
+        device=torch.device("cpu"),
+        target_mean=np.zeros(3, dtype=np.float32),
+        target_std=np.ones(3, dtype=np.float32),
+        nrmse_denom=np.ones(3, dtype=np.float32),
+        input_feature_cfg=input_feature_cfg,
+        front_seg_enabled=True,
+        front_seg_pos_weight=1.0,
+        front_seg_threshold=0.5,
+        max_batches=None,
+    )
+
+    assert "loss" in metrics
+    assert "front_seg_loss" in metrics
+    assert "front_iou" in metrics
+    assert profile["num_eval_batches"] > 0

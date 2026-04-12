@@ -98,3 +98,75 @@ def summarize_channel_metrics(rmse: np.ndarray, nrmse: np.ndarray) -> Dict[str, 
         "nrmse_speed": float(nrmse[2]),
         "nrmse_mean": float(np.mean(nrmse)),
     }
+
+
+def _as_front_5d(t: torch.Tensor, name: str) -> torch.Tensor:
+    if t.dim() == 4:
+        t = t.unsqueeze(2)
+    if t.dim() != 5:
+        raise ValueError(f"{name} must be [B,T,1,H,W] or [B,T,H,W], got {tuple(t.shape)}")
+    if t.size(2) != 1:
+        raise ValueError(f"{name} channel must be 1, got C={int(t.size(2))}.")
+    return t
+
+
+def masked_front_iou_from_logits(
+    logits: torch.Tensor,
+    target_mask: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    threshold: float = 0.5,
+) -> float:
+    if not (0.0 <= float(threshold) <= 1.0):
+        raise ValueError(f"threshold must be in [0, 1], got {threshold}.")
+    logits = _as_front_5d(logits, "logits")
+    target_mask = _as_front_5d(target_mask, "target_mask")
+    if logits.shape != target_mask.shape:
+        raise ValueError(
+            f"logits and target_mask shape mismatch: {tuple(logits.shape)} vs {tuple(target_mask.shape)}"
+        )
+
+    if ocean_mask.dim() == 2:
+        ocean_mask = ocean_mask.unsqueeze(0)
+    if ocean_mask.dim() != 3:
+        raise ValueError(f"ocean_mask must be [H,W] or [B,H,W], got {tuple(ocean_mask.shape)}")
+
+    valid = ocean_mask.to(device=logits.device, dtype=torch.bool).unsqueeze(1).unsqueeze(2)
+    valid = valid.expand(-1, logits.size(1), 1, -1, -1)
+    pred = torch.sigmoid(logits) >= float(threshold)
+    target = target_mask >= 0.5
+    inter = torch.sum(pred & target & valid)
+    union = torch.sum((pred | target) & valid)
+    if int(union.item()) == 0:
+        return 1.0
+    return float((inter.to(torch.float32) / union.to(torch.float32)).item())
+
+
+def masked_front_acc_from_logits(
+    logits: torch.Tensor,
+    target_mask: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    threshold: float = 0.5,
+) -> float:
+    if not (0.0 <= float(threshold) <= 1.0):
+        raise ValueError(f"threshold must be in [0, 1], got {threshold}.")
+    logits = _as_front_5d(logits, "logits")
+    target_mask = _as_front_5d(target_mask, "target_mask")
+    if logits.shape != target_mask.shape:
+        raise ValueError(
+            f"logits and target_mask shape mismatch: {tuple(logits.shape)} vs {tuple(target_mask.shape)}"
+        )
+
+    if ocean_mask.dim() == 2:
+        ocean_mask = ocean_mask.unsqueeze(0)
+    if ocean_mask.dim() != 3:
+        raise ValueError(f"ocean_mask must be [H,W] or [B,H,W], got {tuple(ocean_mask.shape)}")
+
+    valid = ocean_mask.to(device=logits.device, dtype=torch.bool).unsqueeze(1).unsqueeze(2)
+    valid = valid.expand(-1, logits.size(1), 1, -1, -1)
+    pred = torch.sigmoid(logits) >= float(threshold)
+    target = target_mask >= 0.5
+    correct = torch.sum((pred == target) & valid)
+    total = torch.sum(valid)
+    if int(total.item()) == 0:
+        return 1.0
+    return float((correct.to(torch.float32) / total.to(torch.float32)).item())

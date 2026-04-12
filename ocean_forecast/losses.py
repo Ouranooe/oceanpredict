@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 import torch
+import torch.nn.functional as F
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -18,6 +19,52 @@ def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     sq_err = torch.square(pred - target) * mask_5d
     denom = torch.clamp(mask_5d.sum(), min=1.0)
     return sq_err.sum() / denom
+
+
+def masked_front_bce_with_logits_loss(
+    logits: torch.Tensor,
+    target_mask: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    pos_weight: float = 1.0,
+) -> torch.Tensor:
+    """Masked BCEWithLogits for front-like segmentation.
+
+    Args:
+        logits: [B,T,1,H,W] or [B,T,H,W]
+        target_mask: same spatial/time shape as logits, values in {0,1}
+        ocean_mask: [H,W] or [B,H,W]
+        pos_weight: positive class weight for BCEWithLogits
+    """
+    if logits.dim() == 4:
+        logits = logits.unsqueeze(2)
+    if target_mask.dim() == 4:
+        target_mask = target_mask.unsqueeze(2)
+    if logits.dim() != 5 or target_mask.dim() != 5:
+        raise ValueError(
+            f"logits/target_mask must be [B,T,1,H,W] or [B,T,H,W], got {tuple(logits.shape)} / {tuple(target_mask.shape)}"
+        )
+    if logits.shape != target_mask.shape:
+        raise ValueError(
+            f"logits and target_mask shape mismatch: {tuple(logits.shape)} vs {tuple(target_mask.shape)}"
+        )
+    if logits.size(2) != 1:
+        raise ValueError(f"front logits channel must be 1, got C={int(logits.size(2))}.")
+    if float(pos_weight) <= 0:
+        raise ValueError(f"pos_weight must be > 0, got {pos_weight}.")
+
+    if ocean_mask.dim() == 2:
+        ocean_mask = ocean_mask.unsqueeze(0)
+    if ocean_mask.dim() != 3:
+        raise ValueError(f"ocean_mask must be [H,W] or [B,H,W], got {tuple(ocean_mask.shape)}")
+
+    valid = ocean_mask.to(dtype=logits.dtype, device=logits.device).unsqueeze(1).unsqueeze(2)
+    valid = valid.expand(-1, logits.size(1), 1, -1, -1)
+    target = target_mask.to(dtype=logits.dtype, device=logits.device).clamp(0.0, 1.0)
+
+    pw = torch.tensor([float(pos_weight)], dtype=logits.dtype, device=logits.device)
+    loss_map = F.binary_cross_entropy_with_logits(logits, target, reduction="none", pos_weight=pw)
+    denom = torch.clamp(valid.sum(), min=1.0)
+    return (loss_map * valid).sum() / denom
 
 
 def masked_physics_loss(

@@ -58,6 +58,11 @@ def main() -> None:
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     train_cfg = cfg["train"]
+    front_seg_cfg = train_cfg.get("front_seg_aux", {}) or {}
+    front_seg_enabled = bool(front_seg_cfg.get("enabled", True))
+    front_seg_quantile = float(front_seg_cfg.get("quantile", 0.9))
+    front_seg_pos_weight = float(front_seg_cfg.get("pos_weight", 1.0))
+    front_seg_threshold = float(front_seg_cfg.get("threshold", 0.5))
 
     set_seed(int(train_cfg.get("seed", 42)))
     device = resolve_device(train_cfg["device"])
@@ -91,6 +96,8 @@ def main() -> None:
         input_len=int(manifest.input_len),
         pred_len=int(manifest.pred_len),
         stats=stats,
+        front_seg_enabled=front_seg_enabled,
+        front_seg_quantile=front_seg_quantile,
     )
     test_loader = DataLoader(
         test_ds,
@@ -100,10 +107,15 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
+    model_cfg_for_build = dict(model_cfg)
+    if front_seg_enabled and "front_aux_enabled" not in model_cfg_for_build:
+        model_cfg_for_build["front_aux_enabled"] = True
+        _log("Front seg aux enabled: auto-set model.front_aux_enabled=true for evaluation model build.")
+
     model = build_model(
-        model_name=model_cfg["name"],
+        model_name=model_cfg_for_build["name"],
         **_build_model_kwargs(
-            model_cfg,
+            model_cfg_for_build,
             int(manifest.pred_len),
             model_input_channels,
             output_channels=int(stats["target_mean"].shape[0]),
@@ -138,6 +150,9 @@ def main() -> None:
                 target_std=stats["target_std"],
                 nrmse_denom=stats["nrmse_denom"],
                 input_feature_cfg=input_feature_cfg,
+                front_seg_enabled=front_seg_enabled,
+                front_seg_pos_weight=front_seg_pos_weight,
+                front_seg_threshold=front_seg_threshold,
                 max_batches=max_eval_batches,
             )
         finally:
@@ -151,6 +166,9 @@ def main() -> None:
             target_std=stats["target_std"],
             nrmse_denom=stats["nrmse_denom"],
             input_feature_cfg=input_feature_cfg,
+            front_seg_enabled=front_seg_enabled,
+            front_seg_pos_weight=front_seg_pos_weight,
+            front_seg_threshold=front_seg_threshold,
             max_batches=max_eval_batches,
         )
 

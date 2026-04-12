@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Dict
 
 import torch
 from torch import nn
@@ -72,14 +73,24 @@ class TAUForecaster(BaseForecaster):
         max_pred_len: int = 256,
         default_pred_len: int = 72,
         tau_block_layers: int = 0,
+        front_aux_enabled: bool = False,
+        front_aux_hidden_dim: int = 16,
+        front_aux_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.default_pred_len = int(default_pred_len)
         self.max_pred_len = int(max_pred_len)
         self.tau_block_layers = int(tau_block_layers)
+        self.front_aux_enabled = bool(front_aux_enabled)
+        self.front_aux_hidden_dim = int(front_aux_hidden_dim)
+        self.front_aux_dropout = float(front_aux_dropout)
         if self.tau_block_layers < 0 or self.tau_block_layers > 2:
             raise ValueError(f"tau_block_layers must be in [0,2], got {self.tau_block_layers}")
+        if self.front_aux_hidden_dim <= 0:
+            raise ValueError(f"front_aux_hidden_dim must be > 0, got {self.front_aux_hidden_dim}.")
+        if self.front_aux_dropout < 0:
+            raise ValueError(f"front_aux_dropout must be >= 0, got {self.front_aux_dropout}.")
 
         self.encoder = nn.Sequential(
             ConvResBlock(input_channels, self.hidden_dim),
@@ -104,8 +115,18 @@ class TAUForecaster(BaseForecaster):
 
         self.decoder_block = ConvResBlock(self.hidden_dim, self.hidden_dim)
         self.decoder_head = nn.Conv2d(self.hidden_dim, output_channels, kernel_size=1)
+        self.front_head = (
+            nn.Sequential(
+                nn.Conv2d(self.hidden_dim, self.front_aux_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(self.front_aux_dropout) if self.front_aux_dropout > 0 else nn.Identity(),
+                nn.Conv2d(self.front_aux_hidden_dim, 1, kernel_size=1),
+            )
+            if self.front_aux_enabled
+            else None
+        )
 
-    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pred_len: int | None = None) -> torch.Tensor | Dict[str, torch.Tensor]:
         if x.dim() != 5:
             raise ValueError(f"Expected x shape [B,T,C,H,W], got {tuple(x.shape)}")
 
@@ -132,5 +153,11 @@ class TAUForecaster(BaseForecaster):
         context = context + queries.unsqueeze(-1).unsqueeze(-1)
 
         decoded = self.decoder_block(self.dropout(context.reshape(b * t_out, self.hidden_dim, h, w)))
-        decoded = self.decoder_head(decoded)
-        return decoded.reshape(b, t_out, -1, h, w)
+        field = self.decoder_head(decoded).reshape(b, t_out, -1, h, w)
+        if self.front_head is None:
+            return field
+        front_logits = self.front_head(decoded).reshape(b, t_out, 1, h, w)
+        return {
+            "field": field,
+            "front_mask_logits": front_logits,
+        }

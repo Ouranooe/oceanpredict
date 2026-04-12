@@ -66,4 +66,10 @@ train:
     enabled: false
     weight: 0.0
     channels: [sst, sss, speed]
+  front_seg_aux:
+    enabled: true
+    weight: 0.4
+    quantile: 0.9
+    pos_weight: 2.5
+    threshold: 0.5
 

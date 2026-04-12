@@ -109,6 +109,12 @@ train:
     weight: 0.12
     type: huber
     huber_delta: 0.05
+  front_seg_aux:
+    enabled: true
+    weight: 0.4
+    quantile: 0.9
+    pos_weight: 2.5
+    threshold: 0.5
   stability:
     grad_clip:
       enabled: true
